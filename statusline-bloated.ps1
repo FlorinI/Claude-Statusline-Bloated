@@ -485,10 +485,12 @@ $line3 = if ($cacheParts.Count -gt 0) { $cacheParts -join $DIM_SEP } else { $nul
 # Extends cluster 4's cost-escalation theme into a sparkline view: the session's
 # legs (oldest → newest, left → right) are aggregated into up to 8 buckets and
 # the per-bucket average $/leg is rendered with a green→yellow→red gradient.
-# Bucket sizing: if N legs <= 8, one leg per cell with the remaining slots
-# blank. Otherwise N is split into 8 buckets of sizes ceil(N/8) and
-# floor(N/8), with the larger (older-leg) buckets on the left — so recent legs
-# are shown in finer granularity.
+# Position 8 (rightmost) is anchored to the most recent leg(s): when N ≤ 8,
+# each leg gets its own cell and empty slots pad the LEFT; when N > 8, the
+# rightmost `rem = N mod 8` buckets hold ceil(N/8) legs (the newest) and the
+# leftmost 8 − rem buckets hold floor(N/8) (older chunks). Any size mismatch
+# from N % 8 ≠ 0 stays at one end of the row — position 8 always reflects the
+# newest legs, and earlier positions hold progressively older chunks of work.
 $legsLine = $null
 if ($rollup -and $null -ne $rollup.perLegCosts -and @($rollup.perLegCosts).Count -gt 0) {
     $maxBuckets = 8
@@ -504,7 +506,10 @@ if ($rollup -and $null -ne $rollup.perLegCosts -and @($rollup.perLegCosts).Count
         $smallSize = [int][Math]::Floor($n / [double]$maxBuckets)
         $idx = 0
         for ($b = 0; $b -lt $maxBuckets; $b++) {
-            $size = if ($b -lt $rem) { $bigSize } else { $smallSize }
+            # Big buckets on the RIGHT so position 8 always holds the most
+            # recent legs. The rightmost `rem` buckets get ceil(N/8); the rest
+            # get floor(N/8). At N % 8 == 0, all buckets are equal.
+            $size = if ($b -ge ($maxBuckets - $rem)) { $bigSize } else { $smallSize }
             $bucket = @()
             for ($i = 0; $i -lt $size; $i++) {
                 $bucket += $costs[$idx]
@@ -521,7 +526,13 @@ if ($rollup -and $null -ne $rollup.perLegCosts -and @($rollup.perLegCosts).Count
         $avg = $sum / $bucket.Count
         $cells += (ColorLegCell $avg ('$' + ('{0:N2}' -f $avg)))
     }
-    while ($cells.Count -lt $maxBuckets) { $cells += (Dim '·····') }
+    # Pad on the LEFT so the most recent leg always lands in the rightmost slot.
+    $missing = $maxBuckets - $cells.Count
+    if ($missing -gt 0) {
+        $padding = @()
+        for ($i = 0; $i -lt $missing; $i++) { $padding += (Dim '·····') }
+        $cells = $padding + @($cells)
+    }
 
     $legsLine = (Dim 'legs: ') + ($cells -join $DIM_SEP) + (Dim " ($n)")
 }
