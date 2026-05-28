@@ -260,21 +260,27 @@ if ($null -ne $ctxUsed -and $null -ne $ctxSize) {
 }
 $line2 = if ($ctxParts.Count -gt 0) { $ctxParts -join $DIM_SEP } else { $null }
 
-# === Cluster 3: cost density + turn speed ===
-# Four angles on session cost, ordered from broadest aggregate to most recent event:
-#   - $X.XX/Mtok    blended effective rate: total_cost / Σ(billed input + output tokens) × 1M.
-#                   Cumulative/cumulative ratio, bounded by cache-read floor and uncached-output
-#                   ceiling. Doesn't drift with session age — directly reflects how much you're
-#                   paying per token-event of model work (the API's actual billing dimension).
-#   - $X.XX/turn    avg cost per assistant API call (note: a conversational turn often spans
-#                   multiple API calls when tools are used, so this is finer-grained than "turn").
-#   - last $X.XX    cost of the most recent advancement, derived as delta of cumulative cost
-#                   since the last status-line refresh. Stable across idle refreshes.
-#   - turn Xs @ Yt/s  full-turn duration and tokens-per-second, anchored to the latest user prompt.
+# === Cluster 3: cost density (five numbers, three groups) ===
+# Designed to surface context-driven cost escalation. The dominant economic fact:
+# every API call ("leg" — a conversational turn often spans multiple legs when
+# tools are used) re-sends the entire conversation as input, so per-leg cost
+# grows linearly with current context size, and total session cost grows
+# quadratically with session length. The display:
+#   - $X.XX                          absolute cumulative session spend.
+#   - next $X.XX/leg ×R.R (avg $X.XX) forecast of the next leg vs historical avg-$-per-leg,
+#                                     with the next/avg ratio as the headline signal.
+#                                     Forecast = (total_cost / sumInputBilled) × current_ctx_tokens.
+#                                     Avg is anchored to past (smaller-context) legs; forecast
+#                                     scales to current context. Ratio = forecast / avg — a
+#                                     direct measure of how much the current context is
+#                                     inflating the next leg vs typical past legs. 1.0 = parity,
+#                                     2.0 = next leg costs 2x a typical past leg (handover candidate).
+#   - last leg $X.XX                 most recent leg's cost (spike detector).
 $cacheParts = @()
 $tpath = $d.transcript_path
 $sessionId = $d.session_id
 $costUsd = $d.cost.total_cost_usd
+$ctxTok = $d.context_window.total_input_tokens
 
 if ($null -ne $costUsd) {
     $cacheParts += (ColorCost $costUsd ('$' + ('{0:N2}' -f $costUsd)))
@@ -283,28 +289,26 @@ $rollup = $null
 if ($sessionId -and $tpath -and $null -ne $costUsd) {
     $rollup = UpdateSessionRollups $sessionId $tpath $costUsd
 }
-if ($rollup) {
-    # Thresholds calibrated empirically against Claude Code v2.1.153+: same-model recent
-    # sessions cluster around $0.87-$1.09 per Mtok-of-work (~10x below API list prices,
-    # consistent with subscription-style accounting). The formula behind total_cost_usd
-    # changed between v2.1.142 and v2.1.153, so sessions resumed from old Claude Code
-    # versions will read artificially low. Recalibrate again if a future version drifts.
-    $workTokens = [long]$rollup.sumInputBilled + [long]$rollup.sumOutputTokens
-    if ($workTokens -gt 0 -and $costUsd -gt 0) {
-        $eff = ([double]$costUsd / [double]$workTokens) * 1e6
-        $effStr = '$' + ('{0:N2}' -f $eff) + '/Mtok'
-        $cacheParts += ColorHigh $eff $effStr 0.50 2.00
+if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nAssistantTurns -gt 0 `
+        -and [long]$rollup.sumInputBilled -gt 0 -and $null -ne $ctxTok -and $ctxTok -gt 0) {
+    $avgPerLeg        = [double]$costUsd / [double]$rollup.nAssistantTurns
+    $blendedInputRate = [double]$costUsd / [double]$rollup.sumInputBilled
+    $forecast         = $blendedInputRate * [double]$ctxTok
+    $ratio            = if ($avgPerLeg -gt 0) { $forecast / $avgPerLeg } else { $null }
+    $forecastStr      = '$' + ('{0:N2}' -f $forecast) + '/leg'
+    $avgStr           = '$' + ('{0:N2}' -f $avgPerLeg)
+    $part = (Dim 'next ') + (ColorHigh $forecast $forecastStr 0.20 1.00)
+    if ($null -ne $ratio) {
+        $ratioStr = '×{0:N1}' -f $ratio
+        $part += ' ' + (ColorHigh $ratio $ratioStr 1.5 3.0)
     }
-    if ([int]$rollup.nAssistantTurns -gt 0 -and $costUsd -gt 0) {
-        $perTurn = [double]$costUsd / [double]$rollup.nAssistantTurns
-        $perTurnStr = '$' + ('{0:N2}' -f $perTurn) + '/turn'
-        $cacheParts += ColorHigh $perTurn $perTurnStr 0.05 0.20
-    }
-    if ($null -ne $rollup.lastTurnCost -and [double]$rollup.lastTurnCost -gt 0) {
-        $ltc = [double]$rollup.lastTurnCost
-        $ltcStr = '$' + ('{0:N2}' -f $ltc)
-        $cacheParts += (Dim 'last ') + (ColorHigh $ltc $ltcStr 0.05 0.50)
-    }
+    $part += ' ' + (Dim "(avg $avgStr)")
+    $cacheParts += $part
+}
+if ($rollup -and $null -ne $rollup.lastTurnCost -and [double]$rollup.lastTurnCost -gt 0) {
+    $ltc    = [double]$rollup.lastTurnCost
+    $ltcStr = '$' + ('{0:N2}' -f $ltc)
+    $cacheParts += (Dim 'last leg ') + (ColorHigh $ltc $ltcStr 0.05 0.50)
 }
 
 # Full-turn TPS anchored to the latest user-message timestamp.
