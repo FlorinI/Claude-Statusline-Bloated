@@ -86,6 +86,36 @@ function ColorLow($v, $text, $okMin, $warnMin) {
     return (RedBold $text)
 }
 
+# Truecolor gradient for the per-leg cost sparkline. Anchors: $0.05 = green,
+# $0.28 = yellow, $0.50 = red. Below $0.05 clamps to green; above $0.50 clamps
+# to red. Linear RGB interpolation between anchors. Tune the three anchor
+# dollar values below to recalibrate.
+function ColorLegCell($cost, $text) {
+    if ($null -eq $cost) { return $text }
+    $greenAnchor = 0.05; $yellowAnchor = 0.28; $redAnchor = 0.50
+    $g = @(0, 215, 0); $y = @(215, 215, 0); $r = @(215, 0, 0)
+    if ($cost -le $greenAnchor) {
+        $rgb = $g
+    } elseif ($cost -ge $redAnchor) {
+        $rgb = $r
+    } elseif ($cost -le $yellowAnchor) {
+        $t = ($cost - $greenAnchor) / ($yellowAnchor - $greenAnchor)
+        $rgb = @(
+            [int][Math]::Round($g[0] + ($y[0] - $g[0]) * $t),
+            [int][Math]::Round($g[1] + ($y[1] - $g[1]) * $t),
+            [int][Math]::Round($g[2] + ($y[2] - $g[2]) * $t)
+        )
+    } else {
+        $t = ($cost - $yellowAnchor) / ($redAnchor - $yellowAnchor)
+        $rgb = @(
+            [int][Math]::Round($y[0] + ($r[0] - $y[0]) * $t),
+            [int][Math]::Round($y[1] + ($r[1] - $y[1]) * $t),
+            [int][Math]::Round($y[2] + ($r[2] - $y[2]) * $t)
+        )
+    }
+    return "${ESC}[38;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m$text${ESC}[0m"
+}
+
 $DIM_SEP = Dim ' | '
 
 # Per-session cumulative-token rollups, cached in stats-cache.json. Reading the entire
@@ -97,7 +127,7 @@ $DIM_SEP = Dim ' | '
 # last cumulative cost we saw (used to derive last-turn cost as a delta).
 function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
     if (-not $sessionId -or -not $tpath -or -not (Test-Path -LiteralPath $tpath)) { return $null }
-    $statsPath = (Join-Path $HOME '.claude/stats-cache.json')
+    $statsPath = Join-Path $HOME '.claude/stats-cache.json'
     $stats = $null
     if (Test-Path $statsPath) {
         try { $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
@@ -121,17 +151,39 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
             lastOutputTokens = [int]0
             lastSeenCost     = [double]0
             lastTurnCost     = $null
+            perLegCosts      = @()
         }
     }
-    # Migration shim: rollups written by earlier versions of this script counted one
-    # "turn" per content block (each text/tool_use block was logged as its own transcript
-    # entry, so a single API call produced 3-5 lines). Older caches without lastMsgId
-    # are inflated and unsafe to extend; reset them so the next pass repopulates clean.
+    # Migration shim: ensure all required fields exist. Older caches may lack
+    # lastMsgId (when content blocks were counted as separate turns) or
+    # perLegCosts (added with the per-leg sparkline cluster). Adding any
+    # missing field resets all aggregates so the next pass re-scans from byte 0
+    # and refills them consistently. lastSeenCost is reset too so cost
+    # attribution for the re-scan treats it as a fresh session (delta =
+    # currentCost gets distributed across all observed legs).
+    $needsReset = $false
     if ($r.PSObject.Properties.Match('lastMsgId').Count -eq 0) {
         $r | Add-Member -NotePropertyName 'lastMsgId' -NotePropertyValue ''
-        $r.lastByteOffset = 0; $r.nAssistantTurns = 0
-        $r.sumInputBilled = 0; $r.sumOutputTokens = 0
+        $needsReset = $true
     }
+    if ($r.PSObject.Properties.Match('perLegCosts').Count -eq 0) {
+        $r | Add-Member -NotePropertyName 'perLegCosts' -NotePropertyValue @()
+        $needsReset = $true
+    }
+    if ($needsReset) {
+        $r.lastByteOffset   = [long]0
+        $r.nAssistantTurns  = [int]0
+        $r.sumInputBilled   = [long]0
+        $r.sumOutputTokens  = [long]0
+        $r.lastMsgId        = ''
+        $r.lastInputBilled  = [int]0
+        $r.lastOutputTokens = [int]0
+        $r.lastSeenCost     = [double]0
+        $r.lastTurnCost     = $null
+        $r.perLegCosts      = @()
+    }
+    if ($null -eq $r.perLegCosts) { $r.perLegCosts = @() }
+    $skipLastTurnCost = $needsReset
     $nTurnsBefore = [int]$r.nAssistantTurns
 
     $fs = $null
@@ -158,6 +210,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
             if ($lastNl -ge 0) {
                 $processable = $newText.Substring(0, $lastNl + 1)
                 $consumedBytes = [System.Text.Encoding]::UTF8.GetByteCount($processable)
+                $newLegInputs = @()
                 foreach ($line in ($processable -split "`n")) {
                     $line = $line.Trim()
                     if (-not $line) { continue }
@@ -183,9 +236,30 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
                         $r.lastMsgId        = $msgId
                         $r.lastInputBilled  = $inp
                         $r.lastOutputTokens = $out
+                        $newLegInputs += $inp
                     } catch {}
                 }
                 $r.lastByteOffset = [long]$r.lastByteOffset + $consumedBytes
+
+                # Attribute the cost delta across newly observed legs, weighted by
+                # billable input. Frozen at observation time so historical entries
+                # are stable: leftmost sparkline buckets stop moving once filled.
+                # For first-ever scan (and after migration), lastSeenCost is 0 so
+                # delta = currentCost — the full cumulative cost gets distributed
+                # across all legs found in this single pass.
+                if ($newLegInputs.Count -gt 0) {
+                    $deltaCost = [double]$currentCost - [double]$r.lastSeenCost
+                    if ($deltaCost -lt 0) { $deltaCost = 0 }
+                    $sumNewInp = 0
+                    foreach ($v in $newLegInputs) { $sumNewInp += $v }
+                    if ($sumNewInp -gt 0 -and $deltaCost -gt 0) {
+                        foreach ($v in $newLegInputs) {
+                            $r.perLegCosts += [double]($deltaCost * $v / $sumNewInp)
+                        }
+                    } else {
+                        foreach ($v in $newLegInputs) { $r.perLegCosts += [double]0 }
+                    }
+                }
             }
         }
     } catch {}
@@ -195,7 +269,9 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
     # we've genuinely advanced turns (otherwise idle refreshes would zero it out) and
     # when this isn't the first time we've seen the session (lastSeenCost would be 0,
     # making the delta equal full session cost — a bogus "last turn cost" of the whole run).
-    if ($hadPrior -and [int]$r.nAssistantTurns -gt $nTurnsBefore) {
+    # Also skip after a migration-driven reset: lastSeenCost was wiped to 0 so the
+    # delta would equal full session cost.
+    if ($hadPrior -and -not $skipLastTurnCost -and [int]$r.nAssistantTurns -gt $nTurnsBefore) {
         $delta = [double]$currentCost - [double]$r.lastSeenCost
         if ($delta -gt 0) { $r.lastTurnCost = $delta }
     }
@@ -297,7 +373,7 @@ if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nAssistantTurns -gt 0 `
     $ratio            = if ($avgPerLeg -gt 0) { $forecast / $avgPerLeg } else { $null }
     $forecastStr      = '$' + ('{0:N2}' -f $forecast)
     $avgStr           = '$' + ('{0:N2}' -f $avgPerLeg)
-    $part = (Dim 'next leg ') + (ColorHigh $forecast $forecastStr 0.20 1.00)
+    $part = (Dim 'next leg ') + (ColorLegCell $forecast $forecastStr)
     if ($null -ne $ratio) {
         $ratioStr = '{0:N1}' -f $ratio
         $part += (Dim ' = ') + (ColorHigh $ratio $ratioStr 1.5 3.0) + (Dim " x $avgStr (avg)")
@@ -309,7 +385,7 @@ if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nAssistantTurns -gt 0 `
 if ($rollup -and $null -ne $rollup.lastTurnCost -and [double]$rollup.lastTurnCost -gt 0) {
     $ltc    = [double]$rollup.lastTurnCost
     $ltcStr = '$' + ('{0:N2}' -f $ltc)
-    $cacheParts += (Dim 'last = ') + (ColorHigh $ltc $ltcStr 0.05 0.50)
+    $cacheParts += (Dim 'last = ') + (ColorLegCell $ltc $ltcStr)
 }
 
 # Full-turn TPS anchored to the latest user-message timestamp.
@@ -405,6 +481,51 @@ if ($tpath -and (Test-Path -LiteralPath $tpath)) {
 
 $line3 = if ($cacheParts.Count -gt 0) { $cacheParts -join $DIM_SEP } else { $null }
 
+# === Cluster 5: per-leg cost sparkline (8 buckets) ===
+# Extends cluster 4's cost-escalation theme into a sparkline view: the session's
+# legs (oldest → newest, left → right) are aggregated into up to 8 buckets and
+# the per-bucket average $/leg is rendered with a green→yellow→red gradient.
+# Bucket sizing: if N legs <= 8, one leg per cell with the remaining slots
+# blank. Otherwise N is split into 8 buckets of sizes ceil(N/8) and
+# floor(N/8), with the larger (older-leg) buckets on the left — so recent legs
+# are shown in finer granularity.
+$legsLine = $null
+if ($rollup -and $null -ne $rollup.perLegCosts -and @($rollup.perLegCosts).Count -gt 0) {
+    $maxBuckets = 8
+    $costs = @($rollup.perLegCosts | ForEach-Object { [double]$_ })
+    $n = $costs.Count
+
+    $buckets = @()
+    if ($n -le $maxBuckets) {
+        for ($i = 0; $i -lt $n; $i++) { $buckets += ,@($costs[$i]) }
+    } else {
+        $rem = $n % $maxBuckets
+        $bigSize   = [int][Math]::Ceiling($n / [double]$maxBuckets)
+        $smallSize = [int][Math]::Floor($n / [double]$maxBuckets)
+        $idx = 0
+        for ($b = 0; $b -lt $maxBuckets; $b++) {
+            $size = if ($b -lt $rem) { $bigSize } else { $smallSize }
+            $bucket = @()
+            for ($i = 0; $i -lt $size; $i++) {
+                $bucket += $costs[$idx]
+                $idx++
+            }
+            $buckets += ,$bucket
+        }
+    }
+
+    $cells = @()
+    foreach ($bucket in $buckets) {
+        $sum = 0.0
+        foreach ($v in $bucket) { $sum += [double]$v }
+        $avg = $sum / $bucket.Count
+        $cells += (ColorLegCell $avg ('$' + ('{0:N2}' -f $avg)))
+    }
+    while ($cells.Count -lt $maxBuckets) { $cells += (Dim '·····') }
+
+    $legsLine = (Dim 'legs: ') + ($cells -join $DIM_SEP) + (Dim " ($n)")
+}
+
 # === Cluster 4: quota ===
 # Hidden when both 5h and 7d quotas are below 50% — saves a line when there's nothing worth watching.
 $qParts = @()
@@ -430,7 +551,7 @@ if (($p5 -ge 50) -or ($p7 -ge 50)) {
         }
         $qParts += $p
     }
-    $statsPath = (Join-Path $HOME '.claude/stats-cache.json')
+    $statsPath = Join-Path $HOME '.claude/stats-cache.json'
     if (Test-Path $statsPath) {
         try {
             $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
@@ -513,10 +634,11 @@ if ($cwd) {
 
 $out = @()
 $out += $line1
-if ($line2)   { $out += $line2 }
-if ($line4)   { $out += $line4 }
-if ($line3)   { $out += $line3 }
-if ($line5)   { $out += $line5 }
-if ($gitLine) { $out += $gitLine }
+if ($line2)    { $out += $line2 }
+if ($line4)    { $out += $line4 }
+if ($line3)    { $out += $line3 }
+if ($legsLine) { $out += $legsLine }
+if ($line5)    { $out += $line5 }
+if ($gitLine)  { $out += $gitLine }
 
 [Console]::Out.Write(($out -join "`n"))
