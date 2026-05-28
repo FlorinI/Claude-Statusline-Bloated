@@ -134,25 +134,16 @@ if ($null -ne $ctxUsed -and $null -ne $ctxSize) {
 }
 $line2 = if ($ctxParts.Count -gt 0) { $ctxParts -join $DIM_SEP } else { $null }
 
-# === Cluster 3: last-turn tokens ===
+# === Cluster 3: avg cost + turn speed ===
+# avg $/Mtok: cumulative session cost extrapolated against current context size.
+# Answers "what is it costing me on average to land a token of context in the model."
 $cacheParts = @()
-$cu = $d.context_window.current_usage
-if ($cu) {
-    $cr = [int]$cu.cache_read_input_tokens
-    $cw = [int]$cu.cache_creation_input_tokens
-    $ip = [int]$cu.input_tokens
-    $op = [int]$cu.output_tokens
-    $totalIn = $cr + $cw + $ip
-    if ($totalIn -gt 0) {
-        $hit = ($cr / $totalIn) * 100
-        $colored = ColorLow $hit ('{0:N0}%' -f $hit) 80 50
-        $cacheParts += (Dim 'last hit ') + $colored
-        $breakdown = (Dim 'in:') + (FmtNum $ip) +
-                     (Dim ' out:') + (FmtNum $op) +
-                     (Dim ' cr:') + (FmtNum $cr) +
-                     (Dim ' cw:') + (FmtNum $cw)
-        $cacheParts += $breakdown
-    }
+$costUsd = $d.cost.total_cost_usd
+$ctxTok  = $d.context_window.total_input_tokens
+if ($null -ne $costUsd -and $null -ne $ctxTok -and $ctxTok -gt 0 -and $costUsd -gt 0) {
+    $perMtok = ($costUsd / $ctxTok) * 1e6
+    $perMtokStr = '$' + ('{0:N2}' -f $perMtok) + '/Mtok'
+    $cacheParts += (Dim 'avg ') + (ColorHigh $perMtok $perMtokStr 15 50)
 }
 $tpath = $d.transcript_path
 
@@ -274,7 +265,7 @@ if (($p5 -ge 50) -or ($p7 -ge 50)) {
         }
         $qParts += $p
     }
-    $statsPath = Join-Path $HOME '.claude/stats-cache.json'
+    $statsPath = (Join-Path $HOME '.claude/stats-cache.json')
     if (Test-Path $statsPath) {
         try {
             $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
