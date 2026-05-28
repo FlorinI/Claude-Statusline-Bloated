@@ -295,20 +295,21 @@ if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nAssistantTurns -gt 0 `
     $blendedInputRate = [double]$costUsd / [double]$rollup.sumInputBilled
     $forecast         = $blendedInputRate * [double]$ctxTok
     $ratio            = if ($avgPerLeg -gt 0) { $forecast / $avgPerLeg } else { $null }
-    $forecastStr      = '$' + ('{0:N2}' -f $forecast) + '/leg'
+    $forecastStr      = '$' + ('{0:N2}' -f $forecast)
     $avgStr           = '$' + ('{0:N2}' -f $avgPerLeg)
-    $part = (Dim 'next ') + (ColorHigh $forecast $forecastStr 0.20 1.00)
+    $part = (Dim 'next leg ') + (ColorHigh $forecast $forecastStr 0.20 1.00)
     if ($null -ne $ratio) {
-        $ratioStr = '×{0:N1}' -f $ratio
-        $part += ' ' + (ColorHigh $ratio $ratioStr 1.5 3.0)
+        $ratioStr = '{0:N1}' -f $ratio
+        $part += (Dim ' = ') + (ColorHigh $ratio $ratioStr 1.5 3.0) + (Dim " x $avgStr (avg)")
+    } else {
+        $part += (Dim " (avg $avgStr)")
     }
-    $part += ' ' + (Dim "(avg $avgStr)")
     $cacheParts += $part
 }
 if ($rollup -and $null -ne $rollup.lastTurnCost -and [double]$rollup.lastTurnCost -gt 0) {
     $ltc    = [double]$rollup.lastTurnCost
     $ltcStr = '$' + ('{0:N2}' -f $ltc)
-    $cacheParts += (Dim 'last leg ') + (ColorHigh $ltc $ltcStr 0.05 0.50)
+    $cacheParts += (Dim 'last = ') + (ColorHigh $ltc $ltcStr 0.05 0.50)
 }
 
 # Full-turn TPS anchored to the latest user-message timestamp.
