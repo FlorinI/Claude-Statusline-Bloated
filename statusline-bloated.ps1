@@ -88,6 +88,132 @@ function ColorLow($v, $text, $okMin, $warnMin) {
 
 $DIM_SEP = Dim ' | '
 
+# Per-session cumulative-token rollups, cached in stats-cache.json. Reading the entire
+# jsonl transcript on every status-line refresh would be wasteful (transcripts can hit
+# 15+ MB), so we remember the last byte offset we processed and only consume newly
+# appended lines on each invocation. Tracked totals: nAssistantTurns (one per assistant
+# API call — note that a conversational turn can span several), sumInputBilled (input +
+# cache_read + cache_creation across every assistant entry), sumOutputTokens, and the
+# last cumulative cost we saw (used to derive last-turn cost as a delta).
+function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
+    if (-not $sessionId -or -not $tpath -or -not (Test-Path -LiteralPath $tpath)) { return $null }
+    $statsPath = (Join-Path $HOME '.claude/stats-cache.json')
+    $stats = $null
+    if (Test-Path $statsPath) {
+        try { $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
+    }
+    if (-not $stats) { $stats = [pscustomobject]@{} }
+    if ($stats.PSObject.Properties.Match('sessionRollups').Count -eq 0) {
+        $stats | Add-Member -NotePropertyName 'sessionRollups' -NotePropertyValue ([pscustomobject]@{})
+    }
+    $sessions = $stats.sessionRollups
+    $hadPrior = ($sessions.PSObject.Properties.Match($sessionId).Count -gt 0)
+    if ($hadPrior) {
+        $r = $sessions.$sessionId
+    } else {
+        $r = [pscustomobject]@{
+            lastByteOffset   = [long]0
+            nAssistantTurns  = [int]0
+            sumInputBilled   = [long]0
+            sumOutputTokens  = [long]0
+            lastMsgId        = ''
+            lastInputBilled  = [int]0
+            lastOutputTokens = [int]0
+            lastSeenCost     = [double]0
+            lastTurnCost     = $null
+        }
+    }
+    # Migration shim: rollups written by earlier versions of this script counted one
+    # "turn" per content block (each text/tool_use block was logged as its own transcript
+    # entry, so a single API call produced 3-5 lines). Older caches without lastMsgId
+    # are inflated and unsafe to extend; reset them so the next pass repopulates clean.
+    if ($r.PSObject.Properties.Match('lastMsgId').Count -eq 0) {
+        $r | Add-Member -NotePropertyName 'lastMsgId' -NotePropertyValue ''
+        $r.lastByteOffset = 0; $r.nAssistantTurns = 0
+        $r.sumInputBilled = 0; $r.sumOutputTokens = 0
+    }
+    $nTurnsBefore = [int]$r.nAssistantTurns
+
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($tpath, 'Open', 'Read', 'ReadWrite')
+        $totalLen = $fs.Length
+        # Transcript shrank → file rotated/rewound → discard prior rollup and reprocess.
+        if ([long]$r.lastByteOffset -gt $totalLen) {
+            $r.lastByteOffset = 0; $r.nAssistantTurns = 0
+            $r.sumInputBilled = 0; $r.sumOutputTokens = 0
+            $r.lastInputBilled = 0; $r.lastOutputTokens = 0
+        }
+        if ([long]$r.lastByteOffset -lt $totalLen) {
+            $fs.Seek([long]$r.lastByteOffset, 'Begin') | Out-Null
+            $remaining = $totalLen - [long]$r.lastByteOffset
+            $buf = New-Object byte[] $remaining
+            $null = $fs.Read($buf, 0, $remaining)
+            $newText = [System.Text.Encoding]::UTF8.GetString($buf)
+
+            # Only consume complete \n-terminated lines; leave any trailing partial line
+            # for next invocation. Byte offsets must advance by UTF-8 byte length, not
+            # character count, or multi-byte characters would desync our seek position.
+            $lastNl = $newText.LastIndexOf("`n")
+            if ($lastNl -ge 0) {
+                $processable = $newText.Substring(0, $lastNl + 1)
+                $consumedBytes = [System.Text.Encoding]::UTF8.GetByteCount($processable)
+                foreach ($line in ($processable -split "`n")) {
+                    $line = $line.Trim()
+                    if (-not $line) { continue }
+                    if ($line -notmatch '"type"\s*:\s*"assistant"') { continue }
+                    try {
+                        $p = $line | ConvertFrom-Json
+                        if ($p.type -ne 'assistant') { continue }
+                        # Deduplicate by message.id: a single API call's response often
+                        # spans multiple content blocks (text + tool_use), each written
+                        # as its own transcript line but sharing the same message.id and
+                        # usage block. Count once per unique id. Comparing only against
+                        # the *most recent* id is safe because entries for one API call
+                        # are always written contiguously.
+                        $msgId = $p.message.id
+                        if (-not $msgId -or $msgId -eq $r.lastMsgId) { continue }
+                        $u = $p.message.usage
+                        if (-not $u) { continue }
+                        $inp = [int]$u.input_tokens + [int]$u.cache_creation_input_tokens + [int]$u.cache_read_input_tokens
+                        $out = [int]$u.output_tokens
+                        $r.nAssistantTurns  = [int]$r.nAssistantTurns + 1
+                        $r.sumInputBilled   = [long]$r.sumInputBilled + $inp
+                        $r.sumOutputTokens  = [long]$r.sumOutputTokens + $out
+                        $r.lastMsgId        = $msgId
+                        $r.lastInputBilled  = $inp
+                        $r.lastOutputTokens = $out
+                    } catch {}
+                }
+                $r.lastByteOffset = [long]$r.lastByteOffset + $consumedBytes
+            }
+        }
+    } catch {}
+    finally { if ($fs) { try { $fs.Close() } catch {} } }
+
+    # Last-turn cost = delta of cumulative_cost since previous refresh. Only update when
+    # we've genuinely advanced turns (otherwise idle refreshes would zero it out) and
+    # when this isn't the first time we've seen the session (lastSeenCost would be 0,
+    # making the delta equal full session cost — a bogus "last turn cost" of the whole run).
+    if ($hadPrior -and [int]$r.nAssistantTurns -gt $nTurnsBefore) {
+        $delta = [double]$currentCost - [double]$r.lastSeenCost
+        if ($delta -gt 0) { $r.lastTurnCost = $delta }
+    }
+    $r.lastSeenCost = [double]$currentCost
+
+    if ($hadPrior) {
+        $sessions.$sessionId = $r
+    } else {
+        $sessions | Add-Member -NotePropertyName $sessionId -NotePropertyValue $r
+    }
+
+    try {
+        $stats | ConvertTo-Json -Depth 10 | Out-File -FilePath $statsPath -Encoding utf8 -Force
+    } catch {}
+
+    return $r
+}
+
 # === Cluster 1: model + flags ===
 $model    = if ($d.model.display_name) { $d.model.display_name } else { 'unknown' }
 $version  = $d.version
@@ -134,25 +260,62 @@ if ($null -ne $ctxUsed -and $null -ne $ctxSize) {
 }
 $line2 = if ($ctxParts.Count -gt 0) { $ctxParts -join $DIM_SEP } else { $null }
 
-# === Cluster 3: avg cost + turn speed ===
-# avg $/Mtok: cumulative session cost extrapolated against current context size.
-# Answers "what is it costing me on average to land a token of context in the model."
+# === Cluster 3: cost density + turn speed ===
+# Four angles on session cost, ordered from broadest aggregate to most recent event:
+#   - $X.XX/Mtok    blended effective rate: total_cost / Σ(billed input + output tokens) × 1M.
+#                   Cumulative/cumulative ratio, bounded by cache-read floor and uncached-output
+#                   ceiling. Doesn't drift with session age — directly reflects how much you're
+#                   paying per token-event of model work (the API's actual billing dimension).
+#   - $X.XX/turn    avg cost per assistant API call (note: a conversational turn often spans
+#                   multiple API calls when tools are used, so this is finer-grained than "turn").
+#   - last $X.XX    cost of the most recent advancement, derived as delta of cumulative cost
+#                   since the last status-line refresh. Stable across idle refreshes.
+#   - turn Xs @ Yt/s  full-turn duration and tokens-per-second, anchored to the latest user prompt.
 $cacheParts = @()
-$costUsd = $d.cost.total_cost_usd
-$ctxTok  = $d.context_window.total_input_tokens
-if ($null -ne $costUsd -and $null -ne $ctxTok -and $ctxTok -gt 0 -and $costUsd -gt 0) {
-    $perMtok = ($costUsd / $ctxTok) * 1e6
-    $perMtokStr = '$' + ('{0:N2}' -f $perMtok) + '/Mtok'
-    $cacheParts += (Dim 'avg ') + (ColorHigh $perMtok $perMtokStr 15 50)
-}
 $tpath = $d.transcript_path
+$sessionId = $d.session_id
+$costUsd = $d.cost.total_cost_usd
+
+if ($null -ne $costUsd) {
+    $cacheParts += (ColorCost $costUsd ('$' + ('{0:N2}' -f $costUsd)))
+}
+$rollup = $null
+if ($sessionId -and $tpath -and $null -ne $costUsd) {
+    $rollup = UpdateSessionRollups $sessionId $tpath $costUsd
+}
+if ($rollup) {
+    # Thresholds calibrated empirically against Claude Code v2.1.153+: same-model recent
+    # sessions cluster around $0.87-$1.09 per Mtok-of-work (~10x below API list prices,
+    # consistent with subscription-style accounting). The formula behind total_cost_usd
+    # changed between v2.1.142 and v2.1.153, so sessions resumed from old Claude Code
+    # versions will read artificially low. Recalibrate again if a future version drifts.
+    $workTokens = [long]$rollup.sumInputBilled + [long]$rollup.sumOutputTokens
+    if ($workTokens -gt 0 -and $costUsd -gt 0) {
+        $eff = ([double]$costUsd / [double]$workTokens) * 1e6
+        $effStr = '$' + ('{0:N2}' -f $eff) + '/Mtok'
+        $cacheParts += ColorHigh $eff $effStr 0.50 2.00
+    }
+    if ([int]$rollup.nAssistantTurns -gt 0 -and $costUsd -gt 0) {
+        $perTurn = [double]$costUsd / [double]$rollup.nAssistantTurns
+        $perTurnStr = '$' + ('{0:N2}' -f $perTurn) + '/turn'
+        $cacheParts += ColorHigh $perTurn $perTurnStr 0.05 0.20
+    }
+    if ($null -ne $rollup.lastTurnCost -and [double]$rollup.lastTurnCost -gt 0) {
+        $ltc = [double]$rollup.lastTurnCost
+        $ltcStr = '$' + ('{0:N2}' -f $ltc)
+        $cacheParts += (Dim 'last ') + (ColorHigh $ltc $ltcStr 0.05 0.50)
+    }
+}
 
 # Full-turn TPS anchored to the latest user-message timestamp.
-# Reads the last 128 KB of the transcript. If that tail doesn't contain a `type:user`
+# Reads the last 2 MB of the transcript. If that tail doesn't contain a `type:user`
 # entry AND the file is larger than the tail, surface a red `tail!` warning so we
 # know the metric is missing for a real reason (not just a quiet turn).
+# The rendered TPS string is stashed in $tpsRendered and appended in Cluster 5
+# (session line) — TPS belongs with the other session-time stats, not with cost.
 $tailBytes = 2097152
 $tailWarning = $false
+$tpsRendered = $null
 if ($tpath -and (Test-Path -LiteralPath $tpath)) {
     try {
         $fs = [System.IO.File]::Open($tpath, 'Open', 'Read', 'ReadWrite')
@@ -229,13 +392,10 @@ if ($tpath -and (Test-Path -LiteralPath $tpath)) {
                 $tps = $outputSum / $duration
                 $tpsStr = '{0:N0}t/s' -f $tps
                 $coloredTps = ColorLow $tps $tpsStr 30 15
-                $cacheParts += (Dim 'turn ') + (FmtDuration ([int]$duration)) + (Dim ' @ ') + $coloredTps
+                $tpsRendered = (Dim 'turn ') + (FmtDuration ([int]$duration)) + (Dim ' @ ') + $coloredTps
             }
         }
     } catch {}
-}
-if ($tailWarning) {
-    $cacheParts += (RedBold 'tail!')
 }
 
 $line3 = if ($cacheParts.Count -gt 0) { $cacheParts -join $DIM_SEP } else { $null }
@@ -282,10 +442,9 @@ if (($p5 -ge 50) -or ($p7 -ge 50)) {
 $line4 = if ($qParts.Count -gt 0) { $qParts -join $DIM_SEP } else { $null }
 
 # === Cluster 5: session ===
+# Absolute spend ($X.XX) lives in cluster 3 alongside the cost-density metrics;
+# this cluster is purely session activity (time alive vs api, lines, turn TPS).
 $costParts = @()
-if ($null -ne $d.cost.total_cost_usd) {
-    $costParts += (ColorCost $d.cost.total_cost_usd ('$' + ('{0:N2}' -f $d.cost.total_cost_usd)))
-}
 $aliveSec = $null
 if ($tpath -and (Test-Path $tpath)) {
     try {
@@ -304,6 +463,8 @@ if ($null -ne $aliveSec -and $null -ne $apiSec) {
 if ($null -ne $d.cost.total_lines_added -or $null -ne $d.cost.total_lines_removed) {
     $costParts += (Dim ('+{0}/-{1} lines' -f $d.cost.total_lines_added, $d.cost.total_lines_removed))
 }
+if ($tpsRendered) { $costParts += $tpsRendered }
+if ($tailWarning) { $costParts += (RedBold 'tail!') }
 $line5 = if ($costParts.Count -gt 0) { (Dim 'session: ') + ($costParts -join $DIM_SEP) } else { $null }
 
 # === Cluster 6: git ===
