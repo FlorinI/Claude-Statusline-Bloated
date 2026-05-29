@@ -1,6 +1,6 @@
 # Claude-Statusline-Bloated
 
-A dense, multi-line status line for [Claude Code](https://claude.com/claude-code). Shows model + flags, context window + to-compact countdown, last-turn token breakdown + turn TPS, rate-limit quotas, session cost + duration, and git state — color-coded by health.
+A dense, multi-line status line for [Claude Code](https://claude.com/claude-code). Surfaces every dial that affects the model's intelligence, latency, and cost: model + flags, context window (with a two-axis quality read), a per-leg cost-escalation cluster + sparkline, rate-limit quotas, session duration + turn TPS, and git state — all color-coded by health.
 
 Cross-platform: runs on Windows, macOS, and Linux via PowerShell 7+.
 
@@ -9,15 +9,28 @@ Cross-platform: runs on Windows, macOS, and Linux via PowerShell 7+.
 Each cluster is one line; clusters hide themselves when they have nothing useful to say (e.g. the quota line is hidden until you're over 50% on either window).
 
 ```
-Claude Opus 4.7 v2.0.30 | effort:xhigh | fast:on | think:on
-ctx 142k/200k | 71% | to-compact 48k
-5h:62%  (resets 1h22m) | 7d:38%  (resets 4d12h) | today:1.2M
-last hit 87% | in:42  out:1.1k  cr:128k  cw:14k | turn 8s @ 138t/s
-session: $0.87 | 12m alive / 2m18s api | +147/-32 lines
-git: FlorinI/Claude-Statusline-Bloated@main *↑1
+Opus 4.8 (1M context) v2.1.156 | effort:high | fast:off | think:on
+ctx 226.9k/1.00M | 23% | to-compact 723.1k
+5h:52% (resets 27m) | 7d:6% (resets 1d17h)
+$10.38 | next leg $0.45 = 2.4x $0.19 (fresh) | last = $0.13
+legs: $0.17 $0.29 $0.38 $0.37 $0.06 $0.20 $0.22 $0.13 (37)
+session: 2h35m alive / 38m api | +542/-75 lines | turn 3m24s @ 228t/s
+git: you/your-project@main *✓
 ```
 
 The colors lean dim for stable/expected values and pop bright/red only when something needs attention.
+
+## Reading the cost & context signals
+
+This status line is built around one question: *when should I hand the conversation over to a fresh session?* Two independent axes answer it.
+
+**Cost** — the `$… | next leg $X = Rx $Y (fresh) | last = $Z` line. A **leg** is one model API call (a tool-using turn spans several). `next leg $X` forecasts the next leg's cost; `Rx` is that forecast divided by a frozen baseline of your first few legs (`$Y`, "fresh") — so `R` reads as *"the next leg costs R times a fresh one."* It's a window-independent bloat signal: green `<5x` · yellow `5–12x` · red `≥12x`. `last` is the most recent leg's realized cost (a spike detector). The `legs:` line is a sparkline of average $/leg across the session, oldest → newest, so the cost trajectory is visible at a glance. All `$/leg` figures share one green→yellow→red gradient.
+
+**Context quality** — the `ctx <count> | <fill%>` cluster. Long-context degradation has two real components, so it shows two signals:
+- the **token count** is colored by *absolute* "context rot" (gradual weakening that tracks raw token count): green ≤128k · yellow 128–256k · orange 256–500k · red 500k+;
+- the **`%` chip** is colored by *fill fraction* (the sharp cliff near ~60–65% of the window): green <50% · yellow 50–70% · orange 70–85% · red 85%+.
+
+On a 1M-token model the count usually warns first; on a 200k model the fill chip does. `to-compact` shows raw headroom before auto-compaction. (Thresholds reflect 2025–2026 frontier-model long-context benchmarks — not the obsolete 2023-era "~50k and it's dumb" rule of thumb.)
 
 ## Install (for Claude Code agents)
 
@@ -50,7 +63,7 @@ Fetch the raw file and save it to the user's Claude Code config directory.
 
 Use the WebFetch tool to retrieve it, then the Write tool to save it. Preserve byte-for-byte content; this script is whitespace-sensitive in places (the ANSI escape sequences use literal ESC characters).
 
-Verify the file landed: it should be ~365 lines and start with `$ErrorActionPreference = 'SilentlyContinue'`.
+Verify the file landed: it should start with `$ErrorActionPreference = 'SilentlyContinue'`.
 
 ### Step 3 — wire it into `~/.claude/settings.json`
 
@@ -108,18 +121,22 @@ If you're doing this by hand:
 ## Troubleshooting
 
 - **Status line is blank**: PowerShell 7 isn't on PATH, or the script path in `settings.json` is wrong. Test by running `pwsh -File ~/.claude/statusline-bloated.ps1 < /dev/null` (or `Get-Content $null | pwsh -File ...` on Windows) — you should get an error about missing input, not "command not found".
-- **`tail!` shows up in cluster 3**: the script couldn't find your latest user-message timestamp in the transcript tail. Normal during long no-typing stretches; harmless.
+- **`tail!` shows up at the end of the session line**: the script couldn't find your latest user-message timestamp in the transcript tail. Normal during long no-typing stretches; harmless.
 - **Garbled escape codes**: your terminal doesn't speak ANSI. Use a modern terminal (Windows Terminal, iTerm2, recent VS Code integrated terminal).
 - **Debugging**: set `$env:CLAUDE_STATUSLINE_DEBUG = '1'` before launching Claude Code to dump each status-line input JSON to `~/.claude/statusline-input-sample.json`. Useful when something in your `settings.json` or session shape is making a cluster misrender.
 
-## What gets read from disk
+## What gets read and written
 
-The script reads (but never writes):
+**Reads:**
 
-- The current Claude Code session's transcript file (path supplied by Claude in the input JSON) — last 2 MB only.
-- `~/.claude/stats-cache.json` if present, for the "today:" daily-total field in the quota cluster. If absent, that field is silently omitted.
+- The current Claude Code session's transcript file (path supplied by Claude in the input JSON) — incrementally (only newly-appended lines each refresh), plus a 2 MB tail for the turn-TPS metric.
 
-No telemetry. No network calls. Single-file, no dependencies beyond pwsh 7.
+**Writes** (under your `~/.claude/` directory):
+
+- `stats-cache.json` — per-session rollups (leg counts, billable input per leg, daily token totals) so the cost cluster and sparkline don't re-scan the whole transcript on every refresh.
+- `statusline-last.json` — a snapshot of the rendered values (context, fill, cost, the next-leg/fresh ratio, etc.), handy for companion tooling that wants to read the line programmatically.
+
+No telemetry. No network calls. Single file, no dependencies beyond pwsh 7.
 
 ## License
 

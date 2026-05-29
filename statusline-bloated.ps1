@@ -4,8 +4,11 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $input_json = [Console]::In.ReadToEnd()
 $d = $input_json | ConvertFrom-Json
 
+# Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
+$ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+
 if ($env:CLAUDE_STATUSLINE_DEBUG -eq '1') {
-    $input_json | Out-File -FilePath (Join-Path $HOME '.claude/statusline-input-sample.json') -Encoding utf8
+    $input_json | Out-File -FilePath "$ClaudeHome/.claude/statusline-input-sample.json" -Encoding utf8
 }
 
 function FmtPct($v) { if ($null -eq $v) { '--' } else { '{0:N0}%' -f $v } }
@@ -62,12 +65,18 @@ function ColorCost($v, $text) {
     return (RedBold $text)
 }
 
+# Absolute context-rot bands, recalibrated for 2026 frontier models (see
+# docs/long-context-degradation-2026.md). The old 50k/200k thresholds were
+# 2023-era (small-window) and fired far too early. Near-full intelligence holds
+# to ~128k; gradual weakening on hard multi-fact tasks 128-256k; real degradation
+# 256-500k; heavy past 500k. This is the absolute-rot axis; the fill-% chip
+# (BgFill) carries the window-relative ~60-65% cliff. Together they're the hybrid.
 function ColorByTokenCount($tokens, $text) {
     if ($null -eq $tokens) { return $text }
-    if ($tokens -lt 10000)  { return "${ESC}[38;5;46m$text${ESC}[0m" }
-    if ($tokens -lt 50000)  { return "${ESC}[38;5;40m$text${ESC}[0m" }
-    if ($tokens -lt 200000) { return (Yellow $text) }
-    if ($tokens -lt 500000) { return (Orange $text) }
+    if ($tokens -lt 32000)   { return "${ESC}[38;5;46m$text${ESC}[0m" }
+    if ($tokens -lt 128000)  { return "${ESC}[38;5;40m$text${ESC}[0m" }
+    if ($tokens -lt 256000)  { return (Yellow $text) }
+    if ($tokens -lt 500000)  { return (Orange $text) }
     return (RedBold $text)
 }
 
@@ -90,30 +99,63 @@ function ColorLow($v, $text, $okMin, $warnMin) {
 # $0.28 = yellow, $0.50 = red. Below $0.05 clamps to green; above $0.50 clamps
 # to red. Linear RGB interpolation between anchors. Tune the three anchor
 # dollar values below to recalibrate.
-function ColorLegCell($cost, $text) {
-    if ($null -eq $cost) { return $text }
+function LegRGB($cost) {
     $greenAnchor = 0.05; $yellowAnchor = 0.28; $redAnchor = 0.50
     $g = @(0, 215, 0); $y = @(215, 215, 0); $r = @(215, 0, 0)
-    if ($cost -le $greenAnchor) {
-        $rgb = $g
-    } elseif ($cost -ge $redAnchor) {
-        $rgb = $r
-    } elseif ($cost -le $yellowAnchor) {
+    if ($cost -le $greenAnchor) { return $g }
+    if ($cost -ge $redAnchor)   { return $r }
+    if ($cost -le $yellowAnchor) {
         $t = ($cost - $greenAnchor) / ($yellowAnchor - $greenAnchor)
-        $rgb = @(
+        return @(
             [int][Math]::Round($g[0] + ($y[0] - $g[0]) * $t),
             [int][Math]::Round($g[1] + ($y[1] - $g[1]) * $t),
             [int][Math]::Round($g[2] + ($y[2] - $g[2]) * $t)
         )
-    } else {
-        $t = ($cost - $yellowAnchor) / ($redAnchor - $yellowAnchor)
-        $rgb = @(
-            [int][Math]::Round($y[0] + ($r[0] - $y[0]) * $t),
-            [int][Math]::Round($y[1] + ($r[1] - $y[1]) * $t),
-            [int][Math]::Round($y[2] + ($r[2] - $y[2]) * $t)
-        )
     }
+    $t = ($cost - $yellowAnchor) / ($redAnchor - $yellowAnchor)
+    return @(
+        [int][Math]::Round($y[0] + ($r[0] - $y[0]) * $t),
+        [int][Math]::Round($y[1] + ($r[1] - $y[1]) * $t),
+        [int][Math]::Round($y[2] + ($r[2] - $y[2]) * $t)
+    )
+}
+function ColorLegCell($cost, $text) {
+    if ($null -eq $cost) { return $text }
+    $rgb = LegRGB $cost
     return "${ESC}[38;2;$($rgb[0]);$($rgb[1]);$($rgb[2])m$text${ESC}[0m"
+}
+
+# Truecolor band palette for the "muted tint" background chips (the M8 style):
+# the value is drawn in its bright band color on a 30%-intensity tint of the
+# same hue, with one space of padding each side. Used for the background-colored
+# metrics — the cluster-2 fill-% chip and the cluster-3 froz5 cost ratio.
+$BAND_GREEN  = @(0, 200, 0)
+$BAND_YELLOW = @(220, 200, 0)
+$BAND_ORANGE = @(255, 140, 0)
+$BAND_RED    = @(210, 0, 0)
+function BgTint($rgb, $text) {
+    $m0 = [int]($rgb[0] * 0.30); $m1 = [int]($rgb[1] * 0.30); $m2 = [int]($rgb[2] * 0.30)
+    "${ESC}[38;2;$($rgb[0]);$($rgb[1]);$($rgb[2]);48;2;$m0;$m1;${m2}m $text ${ESC}[0m"
+}
+# Context fill-fraction → tint chip. Window-relative quality axis (% of the
+# model's window in use), capturing the ~60-65% effective-context cliff seen
+# across 2026 frontier models (see docs/long-context-degradation-2026.md):
+# yellow as you approach it, orange past it, red near the 95% auto-compact wall.
+# Pairs with ColorByTokenCount (absolute rot) to form the hybrid quality read.
+function BgFill($pct, $text) {
+    if ($null -eq $pct) { return (Dim $text) }
+    if ($pct -lt 50) { return (BgTint $BAND_GREEN $text) }
+    if ($pct -lt 70) { return (BgTint $BAND_YELLOW $text) }
+    if ($pct -lt 85) { return (BgTint $BAND_ORANGE $text) }
+    return (BgTint $BAND_RED $text)
+}
+# Froz5 cost-escalation ratio → tint chip. Window-independent: "next leg costs
+# Nx a fresh leg." Provisional bands.
+function BgFroz5($ratio, $text) {
+    if ($null -eq $ratio) { return (Dim $text) }
+    if ($ratio -lt 5)  { return (BgTint $BAND_GREEN $text) }
+    if ($ratio -lt 12) { return (BgTint $BAND_YELLOW $text) }
+    return (BgTint $BAND_RED $text)
 }
 
 $DIM_SEP = Dim ' | '
@@ -127,7 +169,7 @@ $DIM_SEP = Dim ' | '
 # last cumulative cost we saw (used to derive last-turn cost as a delta).
 function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
     if (-not $sessionId -or -not $tpath -or -not (Test-Path -LiteralPath $tpath)) { return $null }
-    $statsPath = Join-Path $HOME '.claude/stats-cache.json'
+    $statsPath = "$ClaudeHome/.claude/stats-cache.json"
     $stats = $null
     if (Test-Path $statsPath) {
         try { $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
@@ -151,23 +193,22 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
             lastOutputTokens = [int]0
             lastSeenCost     = [double]0
             lastTurnCost     = $null
-            perLegCosts      = @()
+            perLegInputs     = @()
         }
     }
     # Migration shim: ensure all required fields exist. Older caches may lack
     # lastMsgId (when content blocks were counted as separate turns) or
-    # perLegCosts (added with the per-leg sparkline cluster). Adding any
+    # perLegInputs (the per-leg billable-input series behind the sparkline; it
+    # replaced the older frozen perLegCosts cost-delta attribution). Adding any
     # missing field resets all aggregates so the next pass re-scans from byte 0
-    # and refills them consistently. lastSeenCost is reset too so cost
-    # attribution for the re-scan treats it as a fresh session (delta =
-    # currentCost gets distributed across all observed legs).
+    # and refills them consistently.
     $needsReset = $false
     if ($r.PSObject.Properties.Match('lastMsgId').Count -eq 0) {
         $r | Add-Member -NotePropertyName 'lastMsgId' -NotePropertyValue ''
         $needsReset = $true
     }
-    if ($r.PSObject.Properties.Match('perLegCosts').Count -eq 0) {
-        $r | Add-Member -NotePropertyName 'perLegCosts' -NotePropertyValue @()
+    if ($r.PSObject.Properties.Match('perLegInputs').Count -eq 0) {
+        $r | Add-Member -NotePropertyName 'perLegInputs' -NotePropertyValue @()
         $needsReset = $true
     }
     if ($needsReset) {
@@ -180,9 +221,9 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
         $r.lastOutputTokens = [int]0
         $r.lastSeenCost     = [double]0
         $r.lastTurnCost     = $null
-        $r.perLegCosts      = @()
+        $r.perLegInputs     = @()
     }
-    if ($null -eq $r.perLegCosts) { $r.perLegCosts = @() }
+    if ($null -eq $r.perLegInputs) { $r.perLegInputs = @() }
     $skipLastTurnCost = $needsReset
     $nTurnsBefore = [int]$r.nAssistantTurns
 
@@ -195,6 +236,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
             $r.lastByteOffset = 0; $r.nAssistantTurns = 0
             $r.sumInputBilled = 0; $r.sumOutputTokens = 0
             $r.lastInputBilled = 0; $r.lastOutputTokens = 0
+            $r.perLegInputs = @()
         }
         if ([long]$r.lastByteOffset -lt $totalLen) {
             $fs.Seek([long]$r.lastByteOffset, 'Begin') | Out-Null
@@ -210,7 +252,6 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
             if ($lastNl -ge 0) {
                 $processable = $newText.Substring(0, $lastNl + 1)
                 $consumedBytes = [System.Text.Encoding]::UTF8.GetByteCount($processable)
-                $newLegInputs = @()
                 foreach ($line in ($processable -split "`n")) {
                     $line = $line.Trim()
                     if (-not $line) { continue }
@@ -236,30 +277,16 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
                         $r.lastMsgId        = $msgId
                         $r.lastInputBilled  = $inp
                         $r.lastOutputTokens = $out
-                        $newLegInputs += $inp
+                        # Store the leg's billable input. Per-leg DOLLAR cost is derived at
+                        # read time as input × (total_cost / sumInputBilled) — stable and
+                        # always reconciling. We deliberately do NOT attribute cost deltas
+                        # per refresh: total_cost lags the transcript, so each catch-up got
+                        # dumped onto whatever recent leg was observed, producing escalating
+                        # phantom spikes.
+                        $r.perLegInputs += $inp
                     } catch {}
                 }
                 $r.lastByteOffset = [long]$r.lastByteOffset + $consumedBytes
-
-                # Attribute the cost delta across newly observed legs, weighted by
-                # billable input. Frozen at observation time so historical entries
-                # are stable: leftmost sparkline buckets stop moving once filled.
-                # For first-ever scan (and after migration), lastSeenCost is 0 so
-                # delta = currentCost — the full cumulative cost gets distributed
-                # across all legs found in this single pass.
-                if ($newLegInputs.Count -gt 0) {
-                    $deltaCost = [double]$currentCost - [double]$r.lastSeenCost
-                    if ($deltaCost -lt 0) { $deltaCost = 0 }
-                    $sumNewInp = 0
-                    foreach ($v in $newLegInputs) { $sumNewInp += $v }
-                    if ($sumNewInp -gt 0 -and $deltaCost -gt 0) {
-                        foreach ($v in $newLegInputs) {
-                            $r.perLegCosts += [double]($deltaCost * $v / $sumNewInp)
-                        }
-                    } else {
-                        foreach ($v in $newLegInputs) { $r.perLegCosts += [double]0 }
-                    }
-                }
             }
         }
     } catch {}
@@ -322,7 +349,9 @@ if ($null -ne $ctxUsed -and $null -ne $ctxSize) {
     $ctxParts += (Dim 'ctx ') + (ColorByTokenCount $ctxUsed (FmtNum $ctxUsed)) + (Dim ('/' + (FmtNum $ctxSize)))
 }
 if ($null -ne $ctxPct) {
-    $ctxParts += (Dim (FmtPct $ctxPct))
+    # Fill-% chip (window-aware quality axis). The token count above keeps its
+    # absolute foreground coloring — the two run side by side so we can compare.
+    $ctxParts += (BgFill $ctxPct (FmtPct $ctxPct))
 }
 if ($null -ne $ctxUsed -and $null -ne $ctxSize) {
     $compactAt = [int]($ctxSize * 0.95)
@@ -343,14 +372,15 @@ $line2 = if ($ctxParts.Count -gt 0) { $ctxParts -join $DIM_SEP } else { $null }
 # grows linearly with current context size, and total session cost grows
 # quadratically with session length. The display:
 #   - $X.XX                          absolute cumulative session spend.
-#   - next $X.XX/leg ×R.R (avg $X.XX) forecast of the next leg vs historical avg-$-per-leg,
-#                                     with the next/avg ratio as the headline signal.
+#   - next $X.XX =R.Rx $X.XX (fresh)  forecast of the next leg vs a FROZEN "fresh leg"
+#                                     baseline (mean cost of the first up-to-5 non-zero legs).
 #                                     Forecast = (total_cost / sumInputBilled) × current_ctx_tokens.
-#                                     Avg is anchored to past (smaller-context) legs; forecast
-#                                     scales to current context. Ratio = forecast / avg — a
-#                                     direct measure of how much the current context is
-#                                     inflating the next leg vs typical past legs. 1.0 = parity,
-#                                     2.0 = next leg costs 2x a typical past leg (handover candidate).
+#                                     Baseline is anchored to the session's cheap early legs and
+#                                     frozen, so the ratio keeps climbing as context grows and stays
+#                                     loud at high-context plateaus (an all-legs avg collapses toward
+#                                     1.0 there). Ratio = forecast / fresh = "next leg costs Nx a fresh
+#                                     leg" — a window-independent cost signal. Muted-tint background:
+#                                     green <5x, yellow 5-12x, red >=12x (provisional).
 #   - last leg $X.XX                 most recent leg's cost (spike detector).
 $cacheParts = @()
 $tpath = $d.transcript_path
@@ -365,20 +395,39 @@ $rollup = $null
 if ($sessionId -and $tpath -and $null -ne $costUsd) {
     $rollup = UpdateSessionRollups $sessionId $tpath $costUsd
 }
+# Per-leg dollar costs, derived from stored per-leg billable inputs at the session
+# blended rate ($/token). Stable, no zeros, always sums to total_cost. Used by both
+# the froz5 fresh baseline (cluster 3) and the sparkline (cluster 5).
+$perLegCostArr = @()
+if ($rollup -and $null -ne $rollup.perLegInputs -and [long]$rollup.sumInputBilled -gt 0 -and $costUsd -gt 0) {
+    $rate = [double]$costUsd / [double]$rollup.sumInputBilled
+    $perLegCostArr = @($rollup.perLegInputs | ForEach-Object { [double]$rate * [double]$_ })
+}
 if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nAssistantTurns -gt 0 `
         -and [long]$rollup.sumInputBilled -gt 0 -and $null -ne $ctxTok -and $ctxTok -gt 0) {
-    $avgPerLeg        = [double]$costUsd / [double]$rollup.nAssistantTurns
     $blendedInputRate = [double]$costUsd / [double]$rollup.sumInputBilled
     $forecast         = $blendedInputRate * [double]$ctxTok
-    $ratio            = if ($avgPerLeg -gt 0) { $forecast / $avgPerLeg } else { $null }
-    $forecastStr      = '$' + ('{0:N2}' -f $forecast)
-    $avgStr           = '$' + ('{0:N2}' -f $avgPerLeg)
+    # "Fresh leg" baseline: mean derived cost of the first up-to-5 legs. Per-leg
+    # cost = input × blended rate (see $perLegCostArr); early legs' billable inputs
+    # are frozen once observed, so this baseline is stable. Anchored to the session's
+    # cheap early legs, the ratio keeps escalating with context and stays loud at
+    # high-context plateaus — unlike an all-legs average, whose denominator chases the
+    # numerator and collapses toward 1.0. The >0 filter is a harmless guard.
+    $legCosts = @($perLegCostArr | Where-Object { $_ -gt 0 })
+    $freshBaseline = $null
+    if ($legCosts.Count -gt 0) {
+        $baseN = [Math]::Min(5, $legCosts.Count)
+        $sumB = 0.0
+        for ($i = 0; $i -lt $baseN; $i++) { $sumB += $legCosts[$i] }
+        $freshBaseline = $sumB / $baseN
+    }
+    $ratio       = if ($freshBaseline -and $freshBaseline -gt 0) { $forecast / $freshBaseline } else { $null }
+    $forecastStr = '$' + ('{0:N2}' -f $forecast)
     $part = (Dim 'next leg ') + (ColorLegCell $forecast $forecastStr)
     if ($null -ne $ratio) {
-        $ratioStr = '{0:N1}' -f $ratio
-        $part += (Dim ' = ') + (ColorHigh $ratio $ratioStr 1.5 3.0) + (Dim " x $avgStr (avg)")
-    } else {
-        $part += (Dim " (avg $avgStr)")
+        $ratioStr = ('{0:N1}' -f $ratio) + 'x'
+        $freshStr = '$' + ('{0:N2}' -f $freshBaseline)
+        $part += (Dim ' =') + (BgFroz5 $ratio $ratioStr) + (Dim "$freshStr (fresh)")
     }
     $cacheParts += $part
 }
@@ -491,50 +540,40 @@ $line3 = if ($cacheParts.Count -gt 0) { $cacheParts -join $DIM_SEP } else { $nul
 # leftmost 8 − rem buckets hold floor(N/8) (older chunks). Any size mismatch
 # from N % 8 ≠ 0 stays at one end of the row — position 8 always reflects the
 # newest legs, and earlier positions hold progressively older chunks of work.
+# Each bucket's average $/leg renders as a value chip on a muted tint background
+# (the gradient hue on a 30% tint of itself — the "V2" style chosen 2026-05-29).
 $legsLine = $null
-if ($rollup -and $null -ne $rollup.perLegCosts -and @($rollup.perLegCosts).Count -gt 0) {
+if ($perLegCostArr.Count -gt 0) {
     $maxBuckets = 8
-    $costs = @($rollup.perLegCosts | ForEach-Object { [double]$_ })
+    $costs = @($perLegCostArr)
     $n = $costs.Count
 
-    $buckets = @()
+    $bucketAvgs = @()
     if ($n -le $maxBuckets) {
-        for ($i = 0; $i -lt $n; $i++) { $buckets += ,@($costs[$i]) }
+        foreach ($c in $costs) { $bucketAvgs += $c }
     } else {
         $rem = $n % $maxBuckets
         $bigSize   = [int][Math]::Ceiling($n / [double]$maxBuckets)
         $smallSize = [int][Math]::Floor($n / [double]$maxBuckets)
         $idx = 0
         for ($b = 0; $b -lt $maxBuckets; $b++) {
-            # Big buckets on the RIGHT so position 8 always holds the most
-            # recent legs. The rightmost `rem` buckets get ceil(N/8); the rest
-            # get floor(N/8). At N % 8 == 0, all buckets are equal.
             $size = if ($b -ge ($maxBuckets - $rem)) { $bigSize } else { $smallSize }
-            $bucket = @()
-            for ($i = 0; $i -lt $size; $i++) {
-                $bucket += $costs[$idx]
-                $idx++
-            }
-            $buckets += ,$bucket
+            $sum = 0.0
+            for ($i = 0; $i -lt $size; $i++) { $sum += $costs[$idx]; $idx++ }
+            $bucketAvgs += ($sum / $size)
         }
     }
-
-    $cells = @()
-    foreach ($bucket in $buckets) {
-        $sum = 0.0
-        foreach ($v in $bucket) { $sum += [double]$v }
-        $avg = $sum / $bucket.Count
-        $cells += (ColorLegCell $avg ('$' + ('{0:N2}' -f $avg)))
-    }
-    # Pad on the LEFT so the most recent leg always lands in the rightmost slot.
-    $missing = $maxBuckets - $cells.Count
+    # Pad LEFT with $null so the newest bucket stays rightmost.
+    $missing = $maxBuckets - $bucketAvgs.Count
     if ($missing -gt 0) {
-        $padding = @()
-        for ($i = 0; $i -lt $missing; $i++) { $padding += (Dim '·····') }
-        $cells = $padding + @($cells)
+        $pad = @(); for ($i = 0; $i -lt $missing; $i++) { $pad += $null }
+        $bucketAvgs = $pad + $bucketAvgs
     }
 
-    $legsLine = (Dim 'legs: ') + ($cells -join $DIM_SEP) + (Dim " ($n)")
+    $cells = foreach ($c in $bucketAvgs) {
+        if ($null -eq $c) { Dim ' ····· ' } else { BgTint (LegRGB $c) ('$' + ('{0:N2}' -f $c)) }
+    }
+    $legsLine = (Dim 'legs: ') + ($cells -join '') + (Dim " ($n)")
 }
 
 # === Cluster 4: quota ===
@@ -562,7 +601,7 @@ if (($p5 -ge 50) -or ($p7 -ge 50)) {
         }
         $qParts += $p
     }
-    $statsPath = Join-Path $HOME '.claude/stats-cache.json'
+    $statsPath = "$ClaudeHome/.claude/stats-cache.json"
     if (Test-Path $statsPath) {
         try {
             $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
@@ -642,6 +681,59 @@ if ($cwd) {
         $gitLine = (Cyan 'git: ') + $repo + ' ' + $sync
     }
 }
+
+# === Sidecar: persist the computed snapshot for /handover-check ===
+# The status line is the renderer of a state object; /handover-check is its
+# explainer. We already write stats-cache every refresh, so dumping the finished
+# numbers here is ~free, and lets the command read ground truth instead of
+# re-deriving it. Wrapped so a failure here can never break the line.
+try {
+    $absState = if ($null -eq $ctxUsed) { $null }
+        elseif ($ctxUsed -lt 32000)  { 'pristine' }
+        elseif ($ctxUsed -lt 128000) { 'green' }
+        elseif ($ctxUsed -lt 256000) { 'yellow' }
+        elseif ($ctxUsed -lt 500000) { 'orange' }
+        else { 'red' }
+    $fillState = if ($null -eq $ctxPct) { $null }
+        elseif ($ctxPct -lt 50) { 'green' }
+        elseif ($ctxPct -lt 70) { 'yellow' }
+        elseif ($ctxPct -lt 85) { 'orange' }
+        else { 'red' }
+    $froz5State = if ($null -eq $ratio) { $null }
+        elseif ($ratio -lt 5)  { 'green' }
+        elseif ($ratio -lt 12) { 'yellow' }
+        else { 'red' }
+    $toCompactTok = if ($null -ne $ctxUsed -and $null -ne $ctxSize) { [int]($ctxSize * 0.95) - [int]$ctxUsed } else { $null }
+    $activityPct  = if ($aliveSec -and [int]$aliveSec -gt 0 -and $null -ne $apiSec) { [Math]::Round(100.0 * $apiSec / $aliveSec, 1) } else { $null }
+    $snapshot = [ordered]@{
+        schema       = 1
+        sessionId    = $sessionId
+        model        = $model
+        windowSize   = $ctxSize
+        effort       = $effort
+        ctxTokens    = $ctxUsed
+        fillPct      = $ctxPct
+        ctxAbsState  = $absState
+        fillState    = $fillState
+        toCompact    = $toCompactTok
+        costUsd      = $costUsd
+        nextLegUsd   = $forecast
+        froz5Ratio   = $ratio
+        froz5State   = $froz5State
+        freshLegUsd  = $freshBaseline
+        lastLegUsd   = $(if ($rollup) { $rollup.lastTurnCost } else { $null })
+        nLegs        = $(if ($rollup) { [int]$rollup.nAssistantTurns } else { $null })
+        legCosts     = @($perLegCostArr | ForEach-Object { [Math]::Round([double]$_, 4) })
+        aliveSec     = $aliveSec
+        apiSec       = $apiSec
+        activityPct  = $activityPct
+        linesAdded   = $d.cost.total_lines_added
+        linesRemoved = $d.cost.total_lines_removed
+        tps          = $(if ($null -ne $tps) { [int]$tps } else { $null })
+        gitRepo      = $repo
+    }
+    $snapshot | ConvertTo-Json -Depth 5 -Compress | Out-File -FilePath "$ClaudeHome/.claude/statusline-last.json" -Encoding utf8 -Force
+} catch {}
 
 $out = @()
 $out += $line1
