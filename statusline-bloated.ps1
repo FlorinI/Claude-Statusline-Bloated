@@ -149,13 +149,40 @@ function BgFill($pct, $text) {
     if ($pct -lt 85) { return (BgTint $BAND_ORANGE $text) }
     return (BgTint $BAND_RED $text)
 }
-# Froz5 cost-escalation ratio → tint chip. Window-independent: "next leg costs
-# Nx a fresh leg." Provisional bands.
+# Froz5 dollar-ratio → tint chip via a DIVERGING gradient pinned WHITE at parity (1.0):
+# green below 1 (cache reads make the next leg cheaper than a cold early leg), warming
+# yellow→orange→red above 1 as cost outgrows the frozen early baseline. Multi-stop so the
+# warm side reads yellow/orange instead of the muddy pink a straight white→red lerp gives.
+# Anchors are provisional — the red anchor (7×) is model-dependent (200k sessions mostly
+# live green→yellow; 1M deep-context sessions reach orange/red); tune the $stops to
+# recalibrate. The old fixed 5×/12× token-ratio bands are kept in docs/status-line.md.
+function Froz5RGB($ratio) {
+    $stops = @(
+        @(0.5, $BAND_GREEN),
+        @(1.0, @(230, 230, 230)),
+        @(2.0, $BAND_YELLOW),
+        @(4.0, $BAND_ORANGE),
+        @(7.0, $BAND_RED)
+    )
+    if ($ratio -le $stops[0][0])  { return $stops[0][1] }
+    if ($ratio -ge $stops[-1][0]) { return $stops[-1][1] }
+    for ($i = 0; $i -lt $stops.Count - 1; $i++) {
+        $lo = $stops[$i]; $hi = $stops[$i + 1]
+        if ($ratio -le $hi[0]) {
+            $t = ($ratio - $lo[0]) / ($hi[0] - $lo[0])
+            $a = $lo[1]; $b = $hi[1]
+            return @(
+                [int][Math]::Round($a[0] + ($b[0] - $a[0]) * $t),
+                [int][Math]::Round($a[1] + ($b[1] - $a[1]) * $t),
+                [int][Math]::Round($a[2] + ($b[2] - $a[2]) * $t)
+            )
+        }
+    }
+    return $stops[-1][1]
+}
 function BgFroz5($ratio, $text) {
     if ($null -eq $ratio) { return (Dim $text) }
-    if ($ratio -lt 5)  { return (BgTint $BAND_GREEN $text) }
-    if ($ratio -lt 12) { return (BgTint $BAND_YELLOW $text) }
-    return (BgTint $BAND_RED $text)
+    return (BgTint (Froz5RGB $ratio) $text)
 }
 
 $DIM_SEP = Dim ' | '
@@ -163,10 +190,10 @@ $DIM_SEP = Dim ' | '
 # Per-session cumulative-token rollups, cached in stats-cache.json. Reading the entire
 # jsonl transcript on every status-line refresh would be wasteful (transcripts can hit
 # 15+ MB), so we remember the last byte offset we processed and only consume newly
-# appended lines on each invocation. Tracked totals: nAssistantTurns (one per assistant
-# API call — note that a conversational turn can span several), sumInputBilled (input +
+# appended lines on each invocation. Tracked totals: nLegs (one per assistant API call =
+# one "leg" — note that a conversational turn can span several legs), sumInputBilled (input +
 # cache_read + cache_creation across every assistant entry), sumOutputTokens, and the
-# last cumulative cost we saw (used to derive last-turn cost as a delta).
+# last cumulative cost we saw (used to derive last-leg cost as a delta).
 function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
     if (-not $sessionId -or -not $tpath -or -not (Test-Path -LiteralPath $tpath)) { return $null }
     $statsPath = "$ClaudeHome/.claude/stats-cache.json"
@@ -185,21 +212,24 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
     } else {
         $r = [pscustomobject]@{
             lastByteOffset   = [long]0
-            nAssistantTurns  = [int]0
+            nLegs            = [int]0
             sumInputBilled   = [long]0
             sumOutputTokens  = [long]0
             lastMsgId        = ''
             lastInputBilled  = [int]0
             lastOutputTokens = [int]0
             lastSeenCost     = [double]0
-            lastTurnCost     = $null
+            lastLegCost      = $null
             perLegInputs     = @()
+            freshBaselineUsd = $null
         }
     }
     # Migration shim: ensure all required fields exist. Older caches may lack
-    # lastMsgId (when content blocks were counted as separate turns) or
-    # perLegInputs (the per-leg billable-input series behind the sparkline; it
-    # replaced the older frozen perLegCosts cost-delta attribution). Adding any
+    # lastMsgId or perLegInputs (the per-leg billable-input series behind the
+    # sparkline; it replaced the older frozen perLegCosts cost-delta attribution),
+    # use the pre-rename turn-named fields (nAssistantTurns / lastTurnCost — now
+    # nLegs / lastLegCost, since each counts one assistant API call = one leg), or
+    # lack freshBaselineUsd (the frozen fresh-leg dollar baseline). Adding any
     # missing field resets all aggregates so the next pass re-scans from byte 0
     # and refills them consistently.
     $needsReset = $false
@@ -211,32 +241,50 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
         $r | Add-Member -NotePropertyName 'perLegInputs' -NotePropertyValue @()
         $needsReset = $true
     }
+    if ($r.PSObject.Properties.Match('nLegs').Count -eq 0) {
+        $r | Add-Member -NotePropertyName 'nLegs' -NotePropertyValue ([int]0)
+        $r.PSObject.Properties.Remove('nAssistantTurns')
+        $needsReset = $true
+    }
+    if ($r.PSObject.Properties.Match('lastLegCost').Count -eq 0) {
+        $r | Add-Member -NotePropertyName 'lastLegCost' -NotePropertyValue $null
+        $r.PSObject.Properties.Remove('lastTurnCost')
+        $needsReset = $true
+    }
+    if ($r.PSObject.Properties.Match('freshBaselineUsd').Count -eq 0) {
+        $r | Add-Member -NotePropertyName 'freshBaselineUsd' -NotePropertyValue $null
+        $needsReset = $true
+    }
     if ($needsReset) {
         $r.lastByteOffset   = [long]0
-        $r.nAssistantTurns  = [int]0
+        $r.nLegs            = [int]0
         $r.sumInputBilled   = [long]0
         $r.sumOutputTokens  = [long]0
         $r.lastMsgId        = ''
         $r.lastInputBilled  = [int]0
         $r.lastOutputTokens = [int]0
         $r.lastSeenCost     = [double]0
-        $r.lastTurnCost     = $null
+        $r.lastLegCost      = $null
         $r.perLegInputs     = @()
+        $r.freshBaselineUsd = $null
     }
     if ($null -eq $r.perLegInputs) { $r.perLegInputs = @() }
-    $skipLastTurnCost = $needsReset
-    $nTurnsBefore = [int]$r.nAssistantTurns
+    $skipLastLegCost = $needsReset
+    $nLegsBefore = [int]$r.nLegs
 
     $fs = $null
     try {
         $fs = [System.IO.File]::Open($tpath, 'Open', 'Read', 'ReadWrite')
         $totalLen = $fs.Length
         # Transcript shrank → file rotated/rewound → discard prior rollup and reprocess.
+        # (Note: /clear starts a NEW session_id + new file, so it's handled by the
+        # fresh-rollup path, not here. This guards genuine same-id file rewinds.) Reset
+        # freshBaselineUsd too, or post-rewind legs would compare against a stale anchor.
         if ([long]$r.lastByteOffset -gt $totalLen) {
-            $r.lastByteOffset = 0; $r.nAssistantTurns = 0
+            $r.lastByteOffset = 0; $r.nLegs = 0
             $r.sumInputBilled = 0; $r.sumOutputTokens = 0
             $r.lastInputBilled = 0; $r.lastOutputTokens = 0
-            $r.perLegInputs = @()
+            $r.perLegInputs = @(); $r.freshBaselineUsd = $null
         }
         if ([long]$r.lastByteOffset -lt $totalLen) {
             $fs.Seek([long]$r.lastByteOffset, 'Begin') | Out-Null
@@ -271,7 +319,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
                         if (-not $u) { continue }
                         $inp = [int]$u.input_tokens + [int]$u.cache_creation_input_tokens + [int]$u.cache_read_input_tokens
                         $out = [int]$u.output_tokens
-                        $r.nAssistantTurns  = [int]$r.nAssistantTurns + 1
+                        $r.nLegs            = [int]$r.nLegs + 1
                         $r.sumInputBilled   = [long]$r.sumInputBilled + $inp
                         $r.sumOutputTokens  = [long]$r.sumOutputTokens + $out
                         $r.lastMsgId        = $msgId
@@ -292,17 +340,38 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
     } catch {}
     finally { if ($fs) { try { $fs.Close() } catch {} } }
 
-    # Last-turn cost = delta of cumulative_cost since previous refresh. Only update when
-    # we've genuinely advanced turns (otherwise idle refreshes would zero it out) and
+    # Last-leg cost = delta of cumulative_cost since previous refresh. Only update when
+    # we've genuinely advanced legs (otherwise idle refreshes would zero it out) and
     # when this isn't the first time we've seen the session (lastSeenCost would be 0,
-    # making the delta equal full session cost — a bogus "last turn cost" of the whole run).
+    # making the delta equal full session cost — a bogus "last leg cost" of the whole run).
     # Also skip after a migration-driven reset: lastSeenCost was wiped to 0 so the
     # delta would equal full session cost.
-    if ($hadPrior -and -not $skipLastTurnCost -and [int]$r.nAssistantTurns -gt $nTurnsBefore) {
+    if ($hadPrior -and -not $skipLastLegCost -and [int]$r.nLegs -gt $nLegsBefore) {
         $delta = [double]$currentCost - [double]$r.lastSeenCost
-        if ($delta -gt 0) { $r.lastTurnCost = $delta }
+        if ($delta -gt 0) { $r.lastLegCost = $delta }
     }
     $r.lastSeenCost = [double]$currentCost
+
+    # Fresh-leg dollar baseline: the actual mean cost of the first ≤5 legs, snapshotted
+    # once and then FROZEN. Per-leg dollars = billable input × blended rate
+    # (total_cost / sumInputBilled); we recompute the baseline only while fewer than 5
+    # legs have been seen (it evolves at near-early rates as those legs arrive) and lock
+    # it the moment the 5th leg appears — context is still small then, so the blended
+    # rate ≈ the true early-leg rate. Once frozen it never moves, so the displayed
+    # "(fresh)" dollar value stays put while later legs (which benefit from cache reads)
+    # can genuinely read cheaper or pricier against it. Caveat: if the status line first
+    # observes an already-long session (fresh/migrated cache → bulk catch-up scan), nLegs
+    # jumps past 5 in one pass and the snapshot is taken at the current low rate, under-
+    # pricing fresh for that session only — we have no historical per-leg cost to do
+    # better. Sessions observed from launch (the normal case) capture it correctly.
+    if (($null -eq $r.freshBaselineUsd) -or ([int]$r.nLegs -lt 5)) {
+        if ([long]$r.sumInputBilled -gt 0 -and [double]$currentCost -gt 0 -and $r.perLegInputs.Count -ge 1) {
+            $rate   = [double]$currentCost / [double]$r.sumInputBilled
+            $bn     = [Math]::Min(5, $r.perLegInputs.Count)
+            $sumTok = 0.0; for ($i = 0; $i -lt $bn; $i++) { $sumTok += [double]$r.perLegInputs[$i] }
+            $r.freshBaselineUsd = $rate * ($sumTok / $bn)
+        }
+    }
 
     if ($hadPrior) {
         $sessions.$sessionId = $r
@@ -372,15 +441,17 @@ $line2 = if ($ctxParts.Count -gt 0) { $ctxParts -join $DIM_SEP } else { $null }
 # grows linearly with current context size, and total session cost grows
 # quadratically with session length. The display:
 #   - $X.XX                          absolute cumulative session spend.
-#   - next $X.XX =R.Rx $X.XX (fresh)  forecast of the next leg vs a FROZEN "fresh leg"
-#                                     baseline (mean cost of the first up-to-5 non-zero legs).
+#   - next $X.XX =R.Rx $X.XX (fresh)  forecast of the next leg vs the FROZEN "fresh leg"
+#                                     baseline — the actual mean dollar cost of the first
+#                                     up-to-5 legs, snapshotted once early and never moved.
 #                                     Forecast = (total_cost / sumInputBilled) × current_ctx_tokens.
-#                                     Baseline is anchored to the session's cheap early legs and
-#                                     frozen, so the ratio keeps climbing as context grows and stays
-#                                     loud at high-context plateaus (an all-legs avg collapses toward
-#                                     1.0 there). Ratio = forecast / fresh = "next leg costs Nx a fresh
-#                                     leg" — a window-independent cost signal. Muted-tint background:
-#                                     green <5x, yellow 5-12x, red >=12x (provisional).
+#                                     Ratio = forecast / fresh = a TRUE dollar-escalation
+#                                     signal: reads below 1 when cache reads make the next
+#                                     leg cheaper than a cold early leg, and climbs past 1 as
+#                                     context cost outgrows the early anchor. Rendered as a
+#                                     muted-tint chip via a diverging gradient (see Froz5RGB):
+#                                     green below 1, white at parity (1.0), warming to red as it
+#                                     climbs. Gradient anchors are provisional, pending real data.
 #   - last leg $X.XX                 most recent leg's cost (spike detector).
 $cacheParts = @()
 $tpath = $d.transcript_path
@@ -403,24 +474,20 @@ if ($rollup -and $null -ne $rollup.perLegInputs -and [long]$rollup.sumInputBille
     $rate = [double]$costUsd / [double]$rollup.sumInputBilled
     $perLegCostArr = @($rollup.perLegInputs | ForEach-Object { [double]$rate * [double]$_ })
 }
-if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nAssistantTurns -gt 0 `
+if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nLegs -gt 0 `
         -and [long]$rollup.sumInputBilled -gt 0 -and $null -ne $ctxTok -and $ctxTok -gt 0) {
     $blendedInputRate = [double]$costUsd / [double]$rollup.sumInputBilled
     $forecast         = $blendedInputRate * [double]$ctxTok
-    # "Fresh leg" baseline: mean derived cost of the first up-to-5 legs. Per-leg
-    # cost = input × blended rate (see $perLegCostArr); early legs' billable inputs
-    # are frozen once observed, so this baseline is stable. Anchored to the session's
-    # cheap early legs, the ratio keeps escalating with context and stays loud at
-    # high-context plateaus — unlike an all-legs average, whose denominator chases the
-    # numerator and collapses toward 1.0. The >0 filter is a harmless guard.
-    $legCosts = @($perLegCostArr | Where-Object { $_ -gt 0 })
-    $freshBaseline = $null
-    if ($legCosts.Count -gt 0) {
-        $baseN = [Math]::Min(5, $legCosts.Count)
-        $sumB = 0.0
-        for ($i = 0; $i -lt $baseN; $i++) { $sumB += $legCosts[$i] }
-        $freshBaseline = $sumB / $baseN
-    }
+    # "Fresh leg" baseline: the actual mean dollar cost of the first ≤5 legs, snapshotted
+    # once early and FROZEN in the rollup (see UpdateSessionRollups → freshBaselineUsd).
+    # Because it never moves, the displayed "(fresh)" value stays put, and
+    # ratio = forecast ÷ fresh is a TRUE dollar-escalation signal: it reads BELOW 1 when
+    # cache reads make the next leg cheaper than a cold early leg, and climbs past 1 as
+    # context cost outgrows the early anchor. (The old all-legs average collapsed toward
+    # 1.0 at high-context plateaus; a frozen anchor can't chase the numerator, so the
+    # signal stays honest.) The chip is coloured by a diverging gradient (BgFroz5/Froz5RGB):
+    # green <1, white at parity, warming to red as it climbs; gradient anchors provisional.
+    $freshBaseline = if ($null -ne $rollup.freshBaselineUsd) { [double]$rollup.freshBaselineUsd } else { $null }
     $ratio       = if ($freshBaseline -and $freshBaseline -gt 0) { $forecast / $freshBaseline } else { $null }
     $forecastStr = '$' + ('{0:N2}' -f $forecast)
     $part = (Dim 'next leg ') + (ColorLegCell $forecast $forecastStr)
@@ -431,8 +498,8 @@ if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nAssistantTurns -gt 0 `
     }
     $cacheParts += $part
 }
-if ($rollup -and $null -ne $rollup.lastTurnCost -and [double]$rollup.lastTurnCost -gt 0) {
-    $ltc    = [double]$rollup.lastTurnCost
+if ($rollup -and $null -ne $rollup.lastLegCost -and [double]$rollup.lastLegCost -gt 0) {
+    $ltc    = [double]$rollup.lastLegCost
     $ltcStr = '$' + ('{0:N2}' -f $ltc)
     $cacheParts += (Dim 'last = ') + (ColorLegCell $ltc $ltcStr)
 }
@@ -721,8 +788,8 @@ try {
         froz5Ratio   = $ratio
         froz5State   = $froz5State
         freshLegUsd  = $freshBaseline
-        lastLegUsd   = $(if ($rollup) { $rollup.lastTurnCost } else { $null })
-        nLegs        = $(if ($rollup) { [int]$rollup.nAssistantTurns } else { $null })
+        lastLegUsd   = $(if ($rollup) { $rollup.lastLegCost } else { $null })
+        nLegs        = $(if ($rollup) { [int]$rollup.nLegs } else { $null })
         legCosts     = @($perLegCostArr | ForEach-Object { [Math]::Round([double]$_, 4) })
         aliveSec     = $aliveSec
         apiSec       = $apiSec
