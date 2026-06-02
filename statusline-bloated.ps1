@@ -27,6 +27,26 @@ function FmtDuration($sec) {
     if ($sec -lt 86400) { return ("{0}h{1:D2}m" -f [int][Math]::Floor($sec/3600), [int][Math]::Floor(($sec % 3600)/60)) }
     return ("{0}d{1:D2}h" -f [int][Math]::Floor($sec/86400), [int][Math]::Floor(($sec % 86400)/3600))
 }
+function Median($arr) {
+    $vals = @($arr | Where-Object { $null -ne $_ } | Sort-Object)
+    $n = $vals.Count
+    if ($n -eq 0) { return 0.0 }
+    $mid = [int][Math]::Floor($n / 2)
+    if ($n % 2 -eq 1) { return [double]$vals[$mid] }
+    return ([double]$vals[$mid - 1] + [double]$vals[$mid]) / 2.0
+}
+
+# Composition-weighted cost accounting (Option C, see docs/status-line-redesign.md).
+# A leg's token types don't cost the same per token, so summing them into one flat
+# count makes the derived $/token rate drift down over a session as cheap cache-read
+# tokens dominate. Instead we weight each token type by Anthropic's public list-price
+# RATIO (relative to base input price — ratios survive the Max-plan ~10x cost scaling),
+# yielding cost "units". The derived base ($/unit = total_cost / Σunits) is then flat,
+# and cache-heavy legs price correctly (cheap) instead of reading as spikes.
+$M_INPUT       = 1.0     # base input price
+$M_CACHE_WRITE = 1.25    # 5-min ephemeral cache creation (Claude Code default)
+$M_CACHE_READ  = 0.10    # cache hit
+$M_OUTPUT      = 5.0     # output : input for Opus/Sonnet/Haiku 4.x ($15/$75, $3/$15, $1/$5)
 
 # ANSI color helpers
 $ESC = [char]27
@@ -42,6 +62,7 @@ function Orange($t)     { "${ESC}[38;5;208m$t${ESC}[0m" }
 function Magenta($t)    { "${ESC}[95m$t${ESC}[0m" }
 function BrightCyan($t) { "${ESC}[96m$t${ESC}[0m" }
 function DarkGray($t)   { "${ESC}[38;5;240m$t${ESC}[0m" }
+function ColdBlue($t)   { "${ESC}[38;5;33m$t${ESC}[0m" }   # cold-cache marker — readable deep blue (256-color 33)
 function BoldBright($t) { "${ESC}[1;97m$t${ESC}[0m" }
 
 function ColorEffort($lvl) {
@@ -153,16 +174,18 @@ function BgFill($pct, $text) {
 # green below 1 (cache reads make the next leg cheaper than a cold early leg), warming
 # yellow→orange→red above 1 as cost outgrows the frozen early baseline. Multi-stop so the
 # warm side reads yellow/orange instead of the muddy pink a straight white→red lerp gives.
-# Anchors are provisional — the red anchor (7×) is model-dependent (200k sessions mostly
-# live green→yellow; 1M deep-context sessions reach orange/red); tune the $stops to
-# recalibrate. The old fixed 5×/12× token-ratio bands are kept in docs/status-line.md.
+# Anchors RECALIBRATED 2026-06-01 from real data (docs/froz5-calibration-samples.md): the
+# ratio asymptotes ~4× at the 1M wall (0.7@124k → 1.4@252k → 2.3@401k → 2.9@555k → 3.9@800k),
+# so the old orange@4/red@7 never fired. Warm half pulled in to white@1 / yellow@1.8 /
+# orange@2.8 / red@3.8 so a genuinely-extreme deep session actually renders red.
+# The old fixed 5×/12× token-ratio bands are kept in docs/status-line.md.
 function Froz5RGB($ratio) {
     $stops = @(
         @(0.5, $BAND_GREEN),
         @(1.0, @(230, 230, 230)),
-        @(2.0, $BAND_YELLOW),
-        @(4.0, $BAND_ORANGE),
-        @(7.0, $BAND_RED)
+        @(1.8, $BAND_YELLOW),
+        @(2.8, $BAND_ORANGE),
+        @(3.8, $BAND_RED)
     )
     if ($ratio -le $stops[0][0])  { return $stops[0][1] }
     if ($ratio -ge $stops[-1][0]) { return $stops[-1][1] }
@@ -191,84 +214,98 @@ $DIM_SEP = Dim ' | '
 # jsonl transcript on every status-line refresh would be wasteful (transcripts can hit
 # 15+ MB), so we remember the last byte offset we processed and only consume newly
 # appended lines on each invocation. Tracked totals: nLegs (one per assistant API call =
-# one "leg" — note that a conversational turn can span several legs), sumInputBilled (input +
-# cache_read + cache_creation across every assistant entry), sumOutputTokens, and the
-# last cumulative cost we saw (used to derive last-leg cost as a delta).
-function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
+# one "leg" — note that a conversational turn can span several legs), sumUnits
+# (composition-weighted cost units summed across every assistant entry — see the
+# $M_* weights above), sumOutputTokens, the per-leg unit series (perLegUnits and
+# perLegOwnUnits, the latter excluding the cache-read context re-read), and the last
+# cumulative cost we saw (used to derive last-leg cost as a delta).
+function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
     if (-not $sessionId -or -not $tpath -or -not (Test-Path -LiteralPath $tpath)) { return $null }
-    $statsPath = "$ClaudeHome/.claude/stats-cache.json"
-    $stats = $null
-    if (Test-Path $statsPath) {
-        try { $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
+    # Per-session rollup file: each session is the SOLE writer of its own file. This eliminates
+    # the read-modify-write clobber race the single shared stats-cache.json suffered — every open
+    # session rewriting one file every refreshInterval was last-write-wins, which wiped costBaseline
+    # (→ inflated $), reset the cold anchor, and dropped lastLegCost. Prefer a project-local dir
+    # (co-located with the sidecar, same $projRoot/$cwd source); fall back to the global home when no
+    # project dir is resolvable (still per-session → still race-free). The file holds the bare rollup.
+    $statsDir = if ($projRoot) { Join-Path $projRoot '.claude\statusline-stats' } else { Join-Path $ClaudeHome '.claude\statusline-stats' }
+    try { if (-not (Test-Path -LiteralPath $statsDir)) { New-Item -ItemType Directory -Force -Path $statsDir | Out-Null } } catch {}
+    $statsPath = Join-Path $statsDir ($sessionId + '.json')
+    $r = $null
+    if (Test-Path -LiteralPath $statsPath) {
+        try { $r = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
     }
-    if (-not $stats) { $stats = [pscustomobject]@{} }
-    if ($stats.PSObject.Properties.Match('sessionRollups').Count -eq 0) {
-        $stats | Add-Member -NotePropertyName 'sessionRollups' -NotePropertyValue ([pscustomobject]@{})
-    }
-    $sessions = $stats.sessionRollups
-    $hadPrior = ($sessions.PSObject.Properties.Match($sessionId).Count -gt 0)
-    if ($hadPrior) {
-        $r = $sessions.$sessionId
-    } else {
+    $hadPrior = ($null -ne $r)
+    if (-not $hadPrior) {
         $r = [pscustomobject]@{
             lastByteOffset   = [long]0
             nLegs            = [int]0
-            sumInputBilled   = [long]0
+            sumUnits         = [double]0
             sumOutputTokens  = [long]0
             lastMsgId        = ''
             lastInputBilled  = [int]0
             lastOutputTokens = [int]0
             lastSeenCost     = [double]0
             lastLegCost      = $null
-            perLegInputs     = @()
-            freshBaselineUsd = $null
+            perLegUnits      = @()
+            perLegOwnUnits   = @()
+            costBaseline     = $null   # genuinely-new session: captured on first leg (see ~line 371)
+            lastLegTs        = $null   # epoch sec of the most recent leg (cold-cache gap detector + idle countdown anchor)
+            nColdLegs        = [int]0     # legs that hit a cold cache re-create after an idle gap
+            coldWastedUnits  = [double]0  # avoidable cost units burned on cold re-caches (cw × (1.25-0.10))
         }
     }
-    # Migration shim: ensure all required fields exist. Older caches may lack
-    # lastMsgId or perLegInputs (the per-leg billable-input series behind the
-    # sparkline; it replaced the older frozen perLegCosts cost-delta attribution),
-    # use the pre-rename turn-named fields (nAssistantTurns / lastTurnCost — now
-    # nLegs / lastLegCost, since each counts one assistant API call = one leg), or
-    # lack freshBaselineUsd (the frozen fresh-leg dollar baseline). Adding any
-    # missing field resets all aggregates so the next pass re-scans from byte 0
-    # and refills them consistently.
+    # Migration shim (Option C schema). If ANY required field is absent — an older
+    # cache predating composition-weighting (it has perLegInputs/sumInputBilled/
+    # freshBaselineUsd instead of perLegUnits/sumUnits/perLegOwnUnits), or the
+    # pre-rename turn-named fields (nAssistantTurns/lastTurnCost) — we discard the
+    # whole rollup and rebuild it fresh, forcing a one-time re-scan from byte 0. The
+    # transcript's per-leg `usage` block retains the full token breakdown permanently,
+    # so the re-scan recomputes units/ownUnits exactly. Rebuilding as a brand-new
+    # object (rather than patching member-by-member) also drops any stale old-named
+    # properties so they don't linger in the serialized JSON.
+    # NB: the cold-cache fields (lastLegTs/nColdLegs/coldWastedUnits) are deliberately NOT in
+    # $requiredFields — they're additive and get patched in below WITHOUT a destructive reset.
+    # Putting them here would force a full reset+rescan on every existing rollup that lacks them,
+    # which (combined with the shared stats-cache.json being rewritten by concurrent sessions every
+    # refreshInterval) thrashed: it wiped costBaseline → inflated every $ figure, reset the cold
+    # countdown anchor, and dropped lastLegCost. Only genuinely-incompatible OLD schemas reset here.
+    $requiredFields = @('lastByteOffset','nLegs','sumUnits','sumOutputTokens',
+        'lastMsgId','lastInputBilled','lastOutputTokens','lastSeenCost',
+        'lastLegCost','perLegUnits','perLegOwnUnits','costBaseline')
     $needsReset = $false
-    if ($r.PSObject.Properties.Match('lastMsgId').Count -eq 0) {
-        $r | Add-Member -NotePropertyName 'lastMsgId' -NotePropertyValue ''
-        $needsReset = $true
+    foreach ($f in $requiredFields) {
+        if ($r.PSObject.Properties.Match($f).Count -eq 0) { $needsReset = $true; break }
     }
-    if ($r.PSObject.Properties.Match('perLegInputs').Count -eq 0) {
-        $r | Add-Member -NotePropertyName 'perLegInputs' -NotePropertyValue @()
-        $needsReset = $true
-    }
-    if ($r.PSObject.Properties.Match('nLegs').Count -eq 0) {
-        $r | Add-Member -NotePropertyName 'nLegs' -NotePropertyValue ([int]0)
-        $r.PSObject.Properties.Remove('nAssistantTurns')
-        $needsReset = $true
-    }
-    if ($r.PSObject.Properties.Match('lastLegCost').Count -eq 0) {
-        $r | Add-Member -NotePropertyName 'lastLegCost' -NotePropertyValue $null
-        $r.PSObject.Properties.Remove('lastTurnCost')
-        $needsReset = $true
-    }
-    if ($r.PSObject.Properties.Match('freshBaselineUsd').Count -eq 0) {
-        $r | Add-Member -NotePropertyName 'freshBaselineUsd' -NotePropertyValue $null
-        $needsReset = $true
-    }
+    # Preserve a legitimately-captured costBaseline across a genuine reset (it means the same thing
+    # under any schema — the /clear carryover to exclude). Losing it re-includes the carryover and
+    # inflates base. $null if the old schema never had it.
+    $priorBaseline = if ($r.PSObject.Properties.Match('costBaseline').Count -gt 0) { $r.costBaseline } else { $null }
     if ($needsReset) {
-        $r.lastByteOffset   = [long]0
-        $r.nLegs            = [int]0
-        $r.sumInputBilled   = [long]0
-        $r.sumOutputTokens  = [long]0
-        $r.lastMsgId        = ''
-        $r.lastInputBilled  = [int]0
-        $r.lastOutputTokens = [int]0
-        $r.lastSeenCost     = [double]0
-        $r.lastLegCost      = $null
-        $r.perLegInputs     = @()
-        $r.freshBaselineUsd = $null
+        $r = [pscustomobject]@{
+            lastByteOffset   = [long]0
+            nLegs            = [int]0
+            sumUnits         = [double]0
+            sumOutputTokens  = [long]0
+            lastMsgId        = ''
+            lastInputBilled  = [int]0
+            lastOutputTokens = [int]0
+            lastSeenCost     = [double]0
+            lastLegCost      = $null
+            perLegUnits      = @()
+            perLegOwnUnits   = @()
+            costBaseline     = $(if ($null -ne $priorBaseline) { $priorBaseline } else { 0 })  # preserve carryover-exclusion across reset; 0 only if the old schema never captured one
+            lastLegTs        = $null
+            nColdLegs        = [int]0
+            coldWastedUnits  = [double]0
+        }
     }
-    if ($null -eq $r.perLegInputs) { $r.perLegInputs = @() }
+    if ($null -eq $r.perLegUnits)    { $r.perLegUnits = @() }
+    if ($null -eq $r.perLegOwnUnits) { $r.perLegOwnUnits = @() }
+    # Patch in additive cold-cache fields if an existing (non-reset) rollup predates them — no reset,
+    # so costBaseline and all history are preserved.
+    if ($r.PSObject.Properties.Match('lastLegTs').Count -eq 0)       { $r | Add-Member -NotePropertyName lastLegTs -NotePropertyValue $null }
+    if ($r.PSObject.Properties.Match('nColdLegs').Count -eq 0)       { $r | Add-Member -NotePropertyName nColdLegs -NotePropertyValue ([int]0) }
+    if ($r.PSObject.Properties.Match('coldWastedUnits').Count -eq 0) { $r | Add-Member -NotePropertyName coldWastedUnits -NotePropertyValue ([double]0) }
     $skipLastLegCost = $needsReset
     $nLegsBefore = [int]$r.nLegs
 
@@ -278,13 +315,12 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
         $totalLen = $fs.Length
         # Transcript shrank → file rotated/rewound → discard prior rollup and reprocess.
         # (Note: /clear starts a NEW session_id + new file, so it's handled by the
-        # fresh-rollup path, not here. This guards genuine same-id file rewinds.) Reset
-        # freshBaselineUsd too, or post-rewind legs would compare against a stale anchor.
+        # fresh-rollup path, not here. This guards genuine same-id file rewinds.)
         if ([long]$r.lastByteOffset -gt $totalLen) {
             $r.lastByteOffset = 0; $r.nLegs = 0
-            $r.sumInputBilled = 0; $r.sumOutputTokens = 0
+            $r.sumUnits = 0; $r.sumOutputTokens = 0
             $r.lastInputBilled = 0; $r.lastOutputTokens = 0
-            $r.perLegInputs = @(); $r.freshBaselineUsd = $null
+            $r.perLegUnits = @(); $r.perLegOwnUnits = @()
         }
         if ([long]$r.lastByteOffset -lt $totalLen) {
             $fs.Seek([long]$r.lastByteOffset, 'Begin') | Out-Null
@@ -317,21 +353,63 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
                         if (-not $msgId -or $msgId -eq $r.lastMsgId) { continue }
                         $u = $p.message.usage
                         if (-not $u) { continue }
-                        $inp = [int]$u.input_tokens + [int]$u.cache_creation_input_tokens + [int]$u.cache_read_input_tokens
-                        $out = [int]$u.output_tokens
+                        $inTok  = [int]$u.input_tokens
+                        $cwTok  = [int]$u.cache_creation_input_tokens
+                        $crTok  = [int]$u.cache_read_input_tokens
+                        $outTok = [int]$u.output_tokens
+                        # Composition-weighted cost units (Option C): weight each token type
+                        # by its public list-price ratio so the derived $/unit base is flat
+                        # over the session. `units` = the leg's full cost; `ownUnits` = units
+                        # minus the cache-read term (the cost of re-reading prior context),
+                        # i.e. the leg's "own work" — what the forecast's trailing median uses.
+                        $units    = $inTok * $M_INPUT + $cwTok * $M_CACHE_WRITE + $crTok * $M_CACHE_READ + $outTok * $M_OUTPUT
+                        $ownUnits = $inTok * $M_INPUT + $cwTok * $M_CACHE_WRITE + $outTok * $M_OUTPUT
                         $r.nLegs            = [int]$r.nLegs + 1
-                        $r.sumInputBilled   = [long]$r.sumInputBilled + $inp
-                        $r.sumOutputTokens  = [long]$r.sumOutputTokens + $out
+                        $r.sumUnits         = [double]$r.sumUnits + $units
+                        $r.sumOutputTokens  = [long]$r.sumOutputTokens + $outTok
                         $r.lastMsgId        = $msgId
-                        $r.lastInputBilled  = $inp
-                        $r.lastOutputTokens = $out
-                        # Store the leg's billable input. Per-leg DOLLAR cost is derived at
-                        # read time as input × (total_cost / sumInputBilled) — stable and
-                        # always reconciling. We deliberately do NOT attribute cost deltas
-                        # per refresh: total_cost lags the transcript, so each catch-up got
-                        # dumped onto whatever recent leg was observed, producing escalating
-                        # phantom spikes.
-                        $r.perLegInputs += $inp
+                        $r.lastInputBilled  = $inTok + $cwTok + $crTok
+                        $r.lastOutputTokens = $outTok
+                        # Store per-leg units. Per-leg DOLLARS are derived at read time as
+                        # units × base (= total_cost / sumUnits) — stable, no drift, always
+                        # reconciling to total_cost. We deliberately do NOT attribute cost
+                        # deltas per refresh: total_cost lags the transcript, so each catch-up
+                        # got dumped onto whatever recent leg was observed → phantom spikes.
+                        $r.perLegUnits    += $units
+                        $r.perLegOwnUnits += $ownUnits
+                        # Cold re-cache detection. The first leg after an idle gap longer than the
+                        # ~5-min ephemeral-cache TTL re-creates the WHOLE context at cache_write (1.25×)
+                        # instead of cache_read (0.10×). Signature: a big cache_creation with almost no
+                        # cache_read, preceded by a >5-min gap (the gap rules out a legit big paste — that
+                        # keeps the prior context warm, so cache_read stays substantial). Avoidable waste =
+                        # cw × (write − read) units. lastLegTs feeds the next leg's gap.
+                        # Parse the leg's UTC timestamp to epoch seconds. ConvertFrom-Json (PS7) coerces the
+                        # ISO-8601 "…Z" string to a [datetime] (Kind=Utc); [string]-ing that DROPS the offset,
+                        # and a RoundtripKind re-parse then assumes LOCAL — a silent timezone shift (−3h in
+                        # UTC+3) that froze lastLegTs ~3h in the past and pinned the cold state to "cold now".
+                        # Handle the coerced [datetime] directly (cast respects Kind); fall back to
+                        # AssumeUniversal for the raw-string case (PS 5.1 doesn't coerce). Gap-based nColdLegs
+                        # was immune (both legs shifted equally → difference unchanged); only now-vs-lastLegTs broke.
+                        $legTs = $null
+                        if ($p.timestamp) {
+                            try {
+                                $ts = $p.timestamp
+                                if ($ts -is [datetime]) {
+                                    if ($ts.Kind -eq [System.DateTimeKind]::Unspecified) { $ts = [datetime]::SpecifyKind($ts, [System.DateTimeKind]::Utc) }
+                                    $legTs = ([DateTimeOffset]$ts).ToUnixTimeSeconds()
+                                } else {
+                                    $legTs = [DateTimeOffset]::Parse([string]$ts, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal).ToUnixTimeSeconds()
+                                }
+                            } catch {}
+                        }
+                        if ($null -ne $legTs -and $null -ne $r.lastLegTs) {
+                            $gap = [double]$legTs - [double]$r.lastLegTs
+                            if ($gap -gt 300 -and $cwTok -ge 50000 -and $crTok -lt (0.5 * $cwTok)) {
+                                $r.nColdLegs       = [int]$r.nColdLegs + 1
+                                $r.coldWastedUnits = [double]$r.coldWastedUnits + ($cwTok * ($M_CACHE_WRITE - $M_CACHE_READ))
+                            }
+                        }
+                        if ($null -ne $legTs) { $r.lastLegTs = $legTs }
                     } catch {}
                 }
                 $r.lastByteOffset = [long]$r.lastByteOffset + $consumedBytes
@@ -350,38 +428,52 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost) {
         $delta = [double]$currentCost - [double]$r.lastSeenCost
         if ($delta -gt 0) { $r.lastLegCost = $delta }
     }
+    # Sanity guard: a loaded costBaseline can never legitimately exceed the current cumulative
+    # cost (the global total only grows from the carryover point). If it does, it's stale/corrupt
+    # (e.g. a value left by an earlier write race, or a billing-period total reset) and would clamp
+    # sessionCost to ~0 downstream — silently suppressing the cold chip + countdown. Null it so the
+    # capture below re-establishes a sane baseline (the real carryover if still early, else 0).
+    if (($r.PSObject.Properties.Match('costBaseline').Count -gt 0) -and ($null -ne $r.costBaseline) -and ([double]$r.costBaseline -gt [double]$currentCost)) {
+        $r.costBaseline = $null
+    }
+    # Per-session cost baseline. /clear starts a new session_id but does NOT reset
+    # total_cost_usd (it carries across — confirmed v2.1.158), so without this the inherited
+    # cumulative gets divided over the post-clear legs and smeared onto leg-1. Capture the
+    # inherited total ONCE, on a genuinely-new session (its costBaseline starts $null);
+    # migrated/pre-existing sessions start it at 0 so their legitimate total isn't excluded.
+    # Downstream, base/per-leg $/fresh use (currentCost - costBaseline). Leg-1 reads ≈$0
+    # (its cost can't be isolated from the inherited total) — an accepted, bounded edge.
+    if (($r.PSObject.Properties.Match('costBaseline').Count -gt 0) -and ($null -eq $r.costBaseline) -and ([int]$r.nLegs -gt 0)) {
+        # Capture ONLY when observed from near the start (≤5 legs) — a genuine new/cleared session,
+        # where currentCost is the inherited /clear carryover to exclude. If first observed already-long
+        # (bulk catch-up of a pre-existing session), baseline 0: use the global total, since the true
+        # start can't be reconstructed and zeroing a long history would be wrong.
+        if ([int]$r.nLegs -le 5) { $r.costBaseline = [double]$currentCost } else { $r.costBaseline = 0 }
+    }
     $r.lastSeenCost = [double]$currentCost
 
-    # Fresh-leg dollar baseline: the actual mean cost of the first ≤5 legs, snapshotted
-    # once and then FROZEN. Per-leg dollars = billable input × blended rate
-    # (total_cost / sumInputBilled); we recompute the baseline only while fewer than 5
-    # legs have been seen (it evolves at near-early rates as those legs arrive) and lock
-    # it the moment the 5th leg appears — context is still small then, so the blended
-    # rate ≈ the true early-leg rate. Once frozen it never moves, so the displayed
-    # "(fresh)" dollar value stays put while later legs (which benefit from cache reads)
-    # can genuinely read cheaper or pricier against it. Caveat: if the status line first
-    # observes an already-long session (fresh/migrated cache → bulk catch-up scan), nLegs
-    # jumps past 5 in one pass and the snapshot is taken at the current low rate, under-
-    # pricing fresh for that session only — we have no historical per-leg cost to do
-    # better. Sessions observed from launch (the normal case) capture it correctly.
-    if (($null -eq $r.freshBaselineUsd) -or ([int]$r.nLegs -lt 5)) {
-        if ([long]$r.sumInputBilled -gt 0 -and [double]$currentCost -gt 0 -and $r.perLegInputs.Count -ge 1) {
-            $rate   = [double]$currentCost / [double]$r.sumInputBilled
-            $bn     = [Math]::Min(5, $r.perLegInputs.Count)
-            $sumTok = 0.0; for ($i = 0; $i -lt $bn; $i++) { $sumTok += [double]$r.perLegInputs[$i] }
-            $r.freshBaselineUsd = $rate * ($sumTok / $bn)
-        }
-    }
-
-    if ($hadPrior) {
-        $sessions.$sessionId = $r
-    } else {
-        $sessions | Add-Member -NotePropertyName $sessionId -NotePropertyValue $r
-    }
+    # No frozen fresh-leg baseline under Option C: `fresh` is computed live downstream as
+    # base × mean(perLegUnits[0..4]). Because `base` is flat over the session, that value
+    # doesn't drift, and `base` cancels in the froz5 ratio (nextUnits / mean-first-5-units),
+    # so it's rock-stable without snapshotting anything. (The old freshBaselineUsd freeze
+    # was a symptom-patch for the blended-rate drift that composition-weighting removes.)
 
     try {
-        $stats | ConvertTo-Json -Depth 10 | Out-File -FilePath $statsPath -Encoding utf8 -Force
+        $r | ConvertTo-Json -Depth 10 | Out-File -FilePath $statsPath -Encoding utf8 -Force
     } catch {}
+
+    # Prune stale per-session rollups on a session's FIRST render only (rare → cheap; a directory
+    # scan every refresh in every idle session would reintroduce overhead). Delete siblings not
+    # written in >7 days; never the current file. Fully guarded so it can't break the line.
+    if (-not $hadPrior) {
+        try {
+            $cutoff = (Get-Date).AddDays(-7)
+            $self = $sessionId + '.json'
+            Get-ChildItem -LiteralPath $statsDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne $self -and $_.LastWriteTime -lt $cutoff } |
+                ForEach-Object { try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {} }
+        } catch {}
+    }
 
     return $r
 }
@@ -439,16 +531,19 @@ $line2 = if ($ctxParts.Count -gt 0) { $ctxParts -join $DIM_SEP } else { $null }
 # every API call ("leg" — a conversational turn often spans multiple legs when
 # tools are used) re-sends the entire conversation as input, so per-leg cost
 # grows linearly with current context size, and total session cost grows
-# quadratically with session length. The display:
+# quadratically with session length. Costs derive from composition-weighted units
+# (Option C, see docs/status-line-redesign.md): base = total_cost / sumUnits is flat
+# over the session, so all three numbers below are honest and non-drifting. The display:
 #   - $X.XX                          absolute cumulative session spend.
-#   - next $X.XX =R.Rx $X.XX (fresh)  forecast of the next leg vs the FROZEN "fresh leg"
-#                                     baseline — the actual mean dollar cost of the first
-#                                     up-to-5 legs, snapshotted once early and never moved.
-#                                     Forecast = (total_cost / sumInputBilled) × current_ctx_tokens.
-#                                     Ratio = forecast / fresh = a TRUE dollar-escalation
-#                                     signal: reads below 1 when cache reads make the next
-#                                     leg cheaper than a cold early leg, and climbs past 1 as
-#                                     context cost outgrows the early anchor. Rendered as a
+#   - next $X.XX =R.Rx $X.XX (fresh)  ambitious forecast of the next leg vs a live "fresh leg"
+#                                     baseline (= base × mean of the first ≤5 legs' units).
+#                                     Forecast = base × (0.10×ctx_tokens   [EXACT floor: re-read
+#                                     the current context as a cache hit] + median of the last 5
+#                                     legs' own-work units). Ratio = nextUnits / mean-first-5-units
+#                                     (base cancels → rock-stable, anchored to the first 5 legs):
+#                                     a TRUE escalation signal that reads below 1 when caching makes
+#                                     the next leg cheaper than a cold early leg, and climbs past 1
+#                                     as context cost outgrows the early anchor. Rendered as a
 #                                     muted-tint chip via a diverging gradient (see Froz5RGB):
 #                                     green below 1, white at parity (1.0), warming to red as it
 #                                     climbs. Gradient anchors are provisional, pending real data.
@@ -458,50 +553,137 @@ $tpath = $d.transcript_path
 $sessionId = $d.session_id
 $costUsd = $d.cost.total_cost_usd
 $ctxTok = $d.context_window.total_input_tokens
+# Project dir (from the stdin JSON — same source the sidecar dual-write uses below). Derived here,
+# earlier than its git-cluster use, so the per-session rollup file can be project-local.
+$cwd = if ($d.workspace.current_dir) { $d.workspace.current_dir } else { $d.cwd }
 
 if ($null -ne $costUsd) {
     $cacheParts += (ColorCost $costUsd ('$' + ('{0:N2}' -f $costUsd)))
 }
 $rollup = $null
 if ($sessionId -and $tpath -and $null -ne $costUsd) {
-    $rollup = UpdateSessionRollups $sessionId $tpath $costUsd
+    $rollup = UpdateSessionRollups $sessionId $tpath $costUsd $cwd
 }
-# Per-leg dollar costs, derived from stored per-leg billable inputs at the session
-# blended rate ($/token). Stable, no zeros, always sums to total_cost. Used by both
-# the froz5 fresh baseline (cluster 3) and the sparkline (cluster 5).
+# Session-local cost: exclude any cost inherited across a /clear (see costBaseline in
+# UpdateSessionRollups), so per-leg $ / forecast / fresh reflect THIS session's spend rather
+# than the global wallet total. The displayed $total chip (above) stays global on purpose.
+$sessionCost = $costUsd
+if ($rollup -and $rollup.PSObject.Properties.Match('costBaseline').Count -gt 0 -and $null -ne $rollup.costBaseline) {
+    $sessionCost = [double]$costUsd - [double]$rollup.costBaseline
+    if ($sessionCost -lt 0) { $sessionCost = 0 }
+}
+# Per-leg dollar costs = stored per-leg cost units × base (= session_cost / sumUnits).
+# Composition-weighted, so cache-heavy legs price correctly (cheap, not a token-count
+# spike), the bar sums to session_cost exactly, and — because base is flat over the
+# session — it does NOT drift down as cache reads accumulate. Feeds the sparkline (cluster 5).
 $perLegCostArr = @()
-if ($rollup -and $null -ne $rollup.perLegInputs -and [long]$rollup.sumInputBilled -gt 0 -and $costUsd -gt 0) {
-    $rate = [double]$costUsd / [double]$rollup.sumInputBilled
-    $perLegCostArr = @($rollup.perLegInputs | ForEach-Object { [double]$rate * [double]$_ })
+$nextPart = $null   # forecast chip, assembled below — appended AFTER last-leg so the line reads $total | last leg | next …
+if ($rollup -and $null -ne $rollup.perLegUnits -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
+    $base = [double]$sessionCost / [double]$rollup.sumUnits
+    $perLegCostArr = @($rollup.perLegUnits | ForEach-Object { [double]$base * [double]$_ })
 }
-if ($rollup -and $costUsd -gt 0 -and [int]$rollup.nLegs -gt 0 `
-        -and [long]$rollup.sumInputBilled -gt 0 -and $null -ne $ctxTok -and $ctxTok -gt 0) {
-    $blendedInputRate = [double]$costUsd / [double]$rollup.sumInputBilled
-    $forecast         = $blendedInputRate * [double]$ctxTok
-    # "Fresh leg" baseline: the actual mean dollar cost of the first ≤5 legs, snapshotted
-    # once early and FROZEN in the rollup (see UpdateSessionRollups → freshBaselineUsd).
-    # Because it never moves, the displayed "(fresh)" value stays put, and
-    # ratio = forecast ÷ fresh is a TRUE dollar-escalation signal: it reads BELOW 1 when
-    # cache reads make the next leg cheaper than a cold early leg, and climbs past 1 as
-    # context cost outgrows the early anchor. (The old all-legs average collapsed toward
-    # 1.0 at high-context plateaus; a frozen anchor can't chase the numerator, so the
-    # signal stays honest.) The chip is coloured by a diverging gradient (BgFroz5/Froz5RGB):
-    # green <1, white at parity, warming to red as it climbs; gradient anchors provisional.
-    $freshBaseline = if ($null -ne $rollup.freshBaselineUsd) { [double]$rollup.freshBaselineUsd } else { $null }
-    $ratio       = if ($freshBaseline -and $freshBaseline -gt 0) { $forecast / $freshBaseline } else { $null }
+if ($rollup -and $sessionCost -gt 0 -and [int]$rollup.nLegs -gt 0 `
+        -and [double]$rollup.sumUnits -gt 0 -and $null -ne $ctxTok -and $ctxTok -gt 0) {
+    $base = [double]$sessionCost / [double]$rollup.sumUnits
+    # Ambitious next-leg forecast (Option C): an EXACT floor — re-reading the current
+    # context as a cache hit, priced at 0.10× (M_CACHE_READ × ctx_tokens) — plus a robust
+    # own-work estimate (trailing median of the last ≤5 legs' own-work units, so one fat-
+    # output leg doesn't skew it). The floor is the "how did you know" signal: exact, and
+    # ~90% of the real next-leg cost once context is deep.
+    $floorUnits = $M_CACHE_READ * [double]$ctxTok
+    $ownArr     = @($rollup.perLegOwnUnits)
+    $ownTail    = if ($ownArr.Count -gt 5) { @($ownArr[($ownArr.Count - 5)..($ownArr.Count - 1)]) } else { $ownArr }
+    $nextUnits  = $floorUnits + (Median $ownTail)
+    $forecast   = $base * $nextUnits
+    # "Fresh leg" baseline computed live: base × mean(first ≤5 legs' units). base is flat,
+    # so this doesn't drift; and it equals mean(first-5 sparkline cells) by construction.
+    # ratio = forecast ÷ fresh = nextUnits / mean-first-5-units — base CANCELS, so the ratio
+    # is base-independent and rock-stable, anchored to the first 5 legs in honest cost-units.
+    # It reads BELOW 1 when caching makes the next leg cheaper than a cold early leg, and
+    # climbs past 1 as context cost outgrows the early anchor. Coloured by a diverging
+    # gradient (BgFroz5/Froz5RGB): green <1, white at parity, warming to red; anchors provisional.
+    $unitsArr   = @($rollup.perLegUnits)
+    $bn         = [Math]::Min(5, $unitsArr.Count)
+    $freshUnits = 0.0; for ($i = 0; $i -lt $bn; $i++) { $freshUnits += [double]$unitsArr[$i] }
+    if ($bn -gt 0) { $freshUnits = $freshUnits / $bn }
+    $freshBaseline = if ($freshUnits -gt 0) { $base * $freshUnits } else { $null }
+    $ratio         = if ($freshUnits -gt 0) { $nextUnits / $freshUnits } else { $null }
     $forecastStr = '$' + ('{0:N2}' -f $forecast)
-    $part = (Dim 'next leg ') + (ColorLegCell $forecast $forecastStr)
+    $part = (Dim 'next ') + (ColorLegCell $forecast $forecastStr)
     if ($null -ne $ratio) {
         $ratioStr = ('{0:N1}' -f $ratio) + 'x'
         $freshStr = '$' + ('{0:N2}' -f $freshBaseline)
         $part += (Dim ' =') + (BgFroz5 $ratio $ratioStr) + (Dim "$freshStr (fresh)")
     }
-    $cacheParts += $part
+    $nextPart = $part
 }
 if ($rollup -and $null -ne $rollup.lastLegCost -and [double]$rollup.lastLegCost -gt 0) {
     $ltc    = [double]$rollup.lastLegCost
     $ltcStr = '$' + ('{0:N2}' -f $ltc)
-    $cacheParts += (Dim 'last = ') + (ColorLegCell $ltc $ltcStr)
+    $cacheParts += (Dim 'last leg ') + (ColorLegCell $ltc $ltcStr)
+}
+# Forecast comes AFTER last-leg so the cost line reads: $total | last leg | next … (Florian's order).
+if ($nextPart) { $cacheParts += $nextPart }
+# === Cold-cache stats — its own line, rendered below the cost line ===
+# Idle gaps past the ~5-min ephemeral-cache TTL force a full cold RE-CREATE of the context at
+# cache_write (1.25×) instead of cache_read (0.10×). This line quantifies that waste so it's
+# preventable: the retrospective tax already burned (tax + cold-leg share) plus the prospective
+# stake the NEXT leg pays if resumed cold. Split off the cost line (which got too long) and marked
+# by a single leading ❆ in deep blue (ColdBlue) so segments can stay terse. $coldStakes/$coldRemain
+# are ALSO read by the sidecar snapshot block below — keep computing them here.
+$snow = "❆" + [char]0x2009   # thin-space (U+2009) padding between the marker and the first segment.
+# Glyph is ❆ (U+2746), NOT ❄ (U+2744): U+2744 is the only snowflake with an emoji presentation, so
+# terminals/fonts render it as a fixed blue emoji bitmap that IGNORES the SGR colour — the marker
+# colour (dim→blue cooling ramp, below) was a no-op on it. ❆/❅ are pure text dingbats and honour colour.
+$coldParts = @()
+$coldMarkerCol = '2'   # ❆ marker colour: dim by default (retrospective-only / S0 runway), brightens with the cooling ramp
+$coldStakes = $null; $coldRemain = $null
+# Retrospective: tax (% of the displayed $total) + cold-leg share — shown once ≥1 cold leg recorded.
+if ($rollup -and [int]$rollup.nColdLegs -ge 1 -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
+    $coldTax = ([double]$sessionCost / [double]$rollup.sumUnits) * [double]$rollup.coldWastedUnits
+    $nCold   = [int]$rollup.nColdLegs
+    $taxPct  = if ($null -ne $costUsd -and [double]$costUsd -gt 0) { [int][Math]::Round(100.0 * $coldTax / [double]$costUsd) } else { 0 }
+    $coldParts += (Dim 'tax ') + (Dim ($taxPct.ToString() + '% (')) + (ColorCost $coldTax ('$' + ('{0:N2}' -f $coldTax))) + (Dim ')')
+    $nL      = [int]$rollup.nLegs
+    $legPct  = if ($nL -gt 0) { [int][Math]::Round(100.0 * $nCold / $nL) } else { 0 }
+    $coldParts += (Dim "legs $nCold/$nL ($legPct%)")
+}
+# Prospective: the EXTRA $ the next leg pays to re-create the context cold (avoidable units × base).
+if ($rollup -and $null -ne $ctxTok -and $ctxTok -gt 0 -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
+    $coldBase   = [double]$sessionCost / [double]$rollup.sumUnits
+    $coldStakes = $coldBase * [double]$ctxTok * ($M_CACHE_WRITE - $M_CACHE_READ)
+    if ($coldStakes -ge 0.25) {
+        $stakesStr = '+$' + ('{0:N2}' -f $coldStakes)   # leading + = cost ADDED on top of a normal leg
+        if ($null -ne $rollup.lastLegTs) {
+            # Countdown anchored to the last ACTUAL leg's timestamp (the cache-TTL clock), NOT render
+            # time — robust to idle re-renders and rollup resets (which would otherwise re-stamp "now").
+            $nowEpoch   = [int][double]::Parse((Get-Date -UFormat %s))
+            $coldRemain = 300 - ($nowEpoch - [double]$rollup.lastLegTs)
+            if ($coldRemain -gt 0) {
+                # Escalation ramp across the 5-min cooling window: muted while there's runway, louder as
+                # the cache nears expiry so it grabs attention while a SEND can still save the re-create.
+                # (5 min is Anthropic's MINIMUM TTL — entries are "promptly, though not immediately,
+                # deleted", so a send slightly past 0 can still hit a warm cache; this is a conservative
+                # risk signal, not a guarantee. Each sent leg re-reads the cached prefix → resets the clock.)
+                $wCol = if ($coldRemain -gt 240) { '2' } else { '38;5;33' }                      # word 'cold': dim while >4m left, then deep blue
+                $tCol = if ($coldRemain -gt 240) { '2' } elseif ($coldRemain -gt 180) { '97' }   # timer: dim -> white
+                        elseif ($coldRemain -gt 120) { '38;5;220' }                              #        -> yellow
+                        elseif ($coldRemain -gt 60)  { '38;5;208' }                              #        -> orange
+                        else { '1;31' }                                                          #        -> red
+                $coldMarkerCol = $wCol   # ❆ marker tracks the cooling word: dim at S0, deep blue once urgency rises
+                $amt = if ($coldRemain -gt 180) { Dim $stakesStr } else { ColorLegCell $coldStakes $stakesStr }  # amount: dim until <3m left, then leg-cost gradient
+                $coldParts += "${ESC}[${wCol}mcold${ESC}[0m${ESC}[${tCol}m in $(FmtDuration ([int]$coldRemain)) ${ESC}[0m" + $amt
+            } else {
+                # Past the (minimum) TTL — stay NON-definitive: likely cold, but Anthropic's "not immediately
+                # deleted" slack means a send just past 5m can still hit warm. So "cold? >5m", not "cold now".
+                $coldMarkerCol = '38;5;33'
+                $coldParts += (ColdBlue 'cold') + "${ESC}[1;31m? >5m ${ESC}[0m" + (ColorLegCell $coldStakes $stakesStr)
+            }
+        } else {
+            $coldMarkerCol = '38;5;33'
+            $coldParts += (ColdBlue 'cold') + (Dim ' risk ') + (ColorLegCell $coldStakes $stakesStr)
+        }
+    }
 }
 
 # Full-turn TPS anchored to the latest user-message timestamp.
@@ -596,6 +778,9 @@ if ($tpath -and (Test-Path -LiteralPath $tpath)) {
 }
 
 $line3 = if ($cacheParts.Count -gt 0) { $cacheParts -join $DIM_SEP } else { $null }
+# Dedicated cold-cache line (Variant B): one leading ❆ marker in deep blue, then terse segments.
+# Absent entirely when there's no cold activity (no past cold legs and no live ≥$0.25 stake).
+$coldLine = if ($coldParts.Count -gt 0) { "${ESC}[${coldMarkerCol}m${snow}${ESC}[0m" + ' ' + ($coldParts -join $DIM_SEP) } else { $null }
 
 # === Cluster 5: per-leg cost sparkline (8 buckets) ===
 # Extends cluster 4's cost-escalation theme into a sparkline view: the session's
@@ -640,49 +825,57 @@ if ($perLegCostArr.Count -gt 0) {
     $cells = foreach ($c in $bucketAvgs) {
         if ($null -eq $c) { Dim ' ····· ' } else { BgTint (LegRGB $c) ('$' + ('{0:N2}' -f $c)) }
     }
-    $legsLine = (Dim 'legs: ') + ($cells -join '') + (Dim " ($n)")
+    # Label: ≤8 legs → one leg per cell ("$/leg:"); >8 → cells are bucket-averages ("$/leg avg:").
+    # Dim [old]/[new] anchors mark the axis direction (oldest left → newest right).
+    $legLabel = if ($n -le $maxBuckets) { '$/leg: ' } else { '$/leg avg: ' }
+    $legsLine = (Dim $legLabel) + (Dim '[old] ') + ($cells -join '') + (Dim ' [new]') + (Dim " ($n)")
 }
 
-# === Cluster 4: quota ===
-# Hidden when both 5h and 7d quotas are below 50% — saves a line when there's nothing worth watching.
-$qParts = @()
-$rl5 = $d.rate_limits.five_hour
-$rl7 = $d.rate_limits.seven_day
-$p5 = if ($null -ne $rl5.used_percentage) { [double]$rl5.used_percentage } else { 0 }
-$p7 = if ($null -ne $rl7.used_percentage) { [double]$rl7.used_percentage } else { 0 }
-if (($p5 -ge 50) -or ($p7 -ge 50)) {
-    $now = [int][double]::Parse((Get-Date -UFormat %s))
-    if ($null -ne $rl5.used_percentage) {
-        $colored = ColorHigh $rl5.used_percentage (FmtPct $rl5.used_percentage) 70 90
-        $p = (Dim '5h:') + $colored
-        if ($rl5.resets_at) {
-            $p += (Dim (' (resets ' + (FmtDuration ($rl5.resets_at - $now)) + ')'))
-        }
-        $qParts += $p
+# === Cluster 4: quota (per-window vertical-bar pace gauges) ===
+# Each window (5h, 7d) gets its OWN line, shown only when that window is ≥50% consumed (event-driven —
+# most sessions never surface it). Two adjacent block-bars (left=consumed/quota, right=elapsed/time);
+# full glyph height = 100%. BOTH bars + the verdict are coloured by the WORSE of {pace gap, absolute-
+# quota band}, so a near-cap window can't hide behind an "on pace" verdict. The %t (elapsed) lets
+# Florian compare burn against the clock at a glance.
+$qBlocks = ' ',[char]0x2581,[char]0x2582,[char]0x2583,[char]0x2584,[char]0x2585,[char]0x2586,[char]0x2587,[char]0x2588
+$nowQ = [int][double]::Parse((Get-Date -UFormat %s))
+function QLvl($p) { $l = [int][Math]::Round($p / 100.0 * 8); if ($p -gt 0 -and $l -lt 1) { $l = 1 }; if ($l -gt 8) { $l = 8 }; return $l }
+function QuotaLine($label, $rl, $winSec) {
+    if ($null -eq $rl.used_percentage) { return $null }
+    $consumed = [double]$rl.used_percentage
+    if ($consumed -lt 50) { return $null }
+    $elapsed = $null
+    if ($rl.resets_at) {
+        $remain  = [double]$rl.resets_at - $nowQ
+        $elapsed = (($winSec - $remain) / $winSec) * 100.0
+        if ($elapsed -lt 0) { $elapsed = 0 }; if ($elapsed -gt 100) { $elapsed = 100 }
     }
-    if ($null -ne $rl7.used_percentage) {
-        $colored = ColorHigh $rl7.used_percentage (FmtPct $rl7.used_percentage) 70 90
-        $p = (Dim '7d:') + $colored
-        if ($rl7.resets_at) {
-            $p += (Dim (' (resets ' + (FmtDuration ($rl7.resets_at - $now)) + ')'))
-        }
-        $qParts += $p
-    }
-    $statsPath = "$ClaudeHome/.claude/stats-cache.json"
-    if (Test-Path $statsPath) {
-        try {
-            $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
-            $today = (Get-Date).ToString('yyyy-MM-dd')
-            $todayEntry = $stats.dailyModelTokens | Where-Object { $_.date -eq $today }
-            if ($todayEntry) {
-                $sumToday = 0
-                $todayEntry.tokensByModel.PSObject.Properties | ForEach-Object { $sumToday += [int]$_.Value }
-                if ($sumToday -gt 0) { $qParts += (Dim ('today:' + (FmtNum $sumToday))) }
-            }
-        } catch {}
-    }
+    # Severity 0/1/2 = green/yellow/red. Pace = over-burn vs the clock; abs = proximity to the cap.
+    $gap = if ($null -ne $elapsed) { $consumed - $elapsed } else { $null }
+    $paceSev = if ($null -eq $gap) { 0 } elseif ($gap -gt 20) { 2 } elseif ($gap -gt 5) { 1 } else { 0 }
+    $absSev  = if ($consumed -ge 90) { 2 } elseif ($consumed -ge 70) { 1 } else { 0 }
+    $sev = [Math]::Max($paceSev, $absSev)
+    $col = if ($sev -ge 2) { '1;31' } elseif ($sev -eq 1) { '38;5;220' } else { '38;5;40' }
+    $verdict = if ($consumed -ge 90) { 'near cap' }
+        elseif ($null -eq $gap) { '' }
+        elseif ($gap -gt 5) { 'over ' + [int][Math]::Round($gap) + '% gap' }
+        elseif ($gap -lt -5) { 'under ' + [int][Math]::Round(-$gap) + '% gap' }
+        else { 'on pace' }
+    $cbar = $qBlocks[(QLvl $consumed)]
+    $ebar = if ($null -ne $elapsed) { $qBlocks[(QLvl $elapsed)] } else { ' ' }
+    # consumed-LEFT order (Florian's pick); both bars share the severity colour.
+    $bars = "$ESC[${col}m$cbar$ebar$ESC[0m"
+    $etxt = $(if ($null -ne $elapsed) { [int][Math]::Round($elapsed) } else { '--' }).ToString()
+    $s = (Dim "$label ") + $bars + '  ' + "$ESC[${col}m$([int][Math]::Round($consumed))%q$ESC[0m" + (Dim '/') + (Dim ($etxt + '%t'))
+    if ($verdict) { $s += '  ' + "$ESC[${col}m$verdict$ESC[0m" }
+    if ($rl.resets_at) { $s += (Dim ('  resets ' + (FmtDuration ([int]([double]$rl.resets_at - $nowQ))))) }
+    return $s
 }
-$line4 = if ($qParts.Count -gt 0) { $qParts -join $DIM_SEP } else { $null }
+$qLines = @()
+$q5 = QuotaLine '5h' $d.rate_limits.five_hour 18000
+$q7 = QuotaLine '7d' $d.rate_limits.seven_day 604800
+if ($q5) { $qLines += $q5 }
+if ($q7) { $qLines += $q7 }
 
 # === Cluster 5: session ===
 # Absolute spend ($X.XX) lives in cluster 3 alongside the cost-density metrics;
@@ -708,10 +901,26 @@ if ($null -ne $d.cost.total_lines_added -or $null -ne $d.cost.total_lines_remove
 }
 if ($tpsRendered) { $costParts += $tpsRendered }
 if ($tailWarning) { $costParts += (RedBold 'tail!') }
+# Daily cross-session token usage — moved here from the quota cluster (now event-gated at ≥50%), so
+# it stays visible. stats-cache.json holds ONLY the externally-populated dailyModelTokens counter;
+# per-session rollups live in <project>/.claude/statusline-stats/<sessionId>.json (race fix).
+$statsPath = "$ClaudeHome/.claude/stats-cache.json"
+if (Test-Path $statsPath) {
+    try {
+        $stats = Get-Content $statsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json
+        $today = (Get-Date).ToString('yyyy-MM-dd')
+        $todayEntry = $stats.dailyModelTokens | Where-Object { $_.date -eq $today }
+        if ($todayEntry) {
+            $sumToday = 0
+            $todayEntry.tokensByModel.PSObject.Properties | ForEach-Object { $sumToday += [int]$_.Value }
+            if ($sumToday -gt 0) { $costParts += (Dim ('today:' + (FmtNum $sumToday))) }
+        }
+    } catch {}
+}
 $line5 = if ($costParts.Count -gt 0) { (Dim 'session: ') + ($costParts -join $DIM_SEP) } else { $null }
 
 # === Cluster 6: git ===
-$cwd = if ($d.workspace.current_dir) { $d.workspace.current_dir } else { $d.cwd }
+# $cwd derived earlier (near the cost cluster) for the per-session rollup path; reused here.
 $gitLine = $null
 if ($cwd) {
     $porcelain = & git -C "$cwd" --no-optional-locks status --porcelain=v2 --branch 2>$null
@@ -745,7 +954,7 @@ if ($cwd) {
             if ($u -match '[:/]([^:/]+)/([^:/]+)$') { $remote = "$($matches[1])/$($matches[2])" }
         }
         $repo = if ($remote) { "$remote@$branch" } else { $branch }
-        $gitLine = (Cyan 'git: ') + $repo + ' ' + $sync
+        $gitLine = (Dim 'git: ') + $repo + ' ' + $sync
     }
 }
 
@@ -766,15 +975,35 @@ try {
         elseif ($ctxPct -lt 70) { 'yellow' }
         elseif ($ctxPct -lt 85) { 'orange' }
         else { 'red' }
+    # Discretized froz5 state, aligned to the Froz5RGB diverging-gradient stops (parity at
+    # 1.0). Provisional — the gradient anchors are mid-recalibration under Option C; the
+    # /handover-check consumer reads froz5Ratio qualitatively, not this field.
     $froz5State = if ($null -eq $ratio) { $null }
-        elseif ($ratio -lt 5)  { 'green' }
-        elseif ($ratio -lt 12) { 'yellow' }
+        elseif ($ratio -lt 1.0) { 'green' }
+        elseif ($ratio -lt 1.8) { 'white' }
+        elseif ($ratio -lt 2.8) { 'yellow' }
+        elseif ($ratio -lt 3.8) { 'orange' }
         else { 'red' }
     $toCompactTok = if ($null -ne $ctxUsed -and $null -ne $ctxSize) { [int]($ctxSize * 0.95) - [int]$ctxUsed } else { $null }
     $activityPct  = if ($aliveSec -and [int]$aliveSec -gt 0 -and $null -ne $apiSec) { [Math]::Round(100.0 * $apiSec / $aliveSec, 1) } else { $null }
+    # Cold-cache snapshot fields — mirror the §Cold-cache chip (A/B) state machine so /handover-check
+    # can surface the PROSPECTIVE stake (the ❆ chip), not just the retrospective cold-tax. These reuse
+    # $coldStakes / $coldRemain computed in the chip block above. coldStakeUsd = EXTRA $ the next leg
+    # pays if taken cold now (null below the $0.25 surface threshold); coldState ∈ cooling|cold|idle-cold.
+    $coldStakeUsd = $null; $coldState = $null; $coldCoolRemainSec = $null
+    if ($null -ne $coldStakes -and $coldStakes -ge 0.25) {
+        $coldStakeUsd = [Math]::Round([double]$coldStakes, 2)
+        if ($null -ne $rollup.lastLegTs) {
+            if ($null -ne $coldRemain -and $coldRemain -gt 0) { $coldState = 'cooling'; $coldCoolRemainSec = [int]$coldRemain }
+            else { $coldState = 'cold' }
+        } else { $coldState = 'idle-cold' }
+    }
     $snapshot = [ordered]@{
-        schema       = 1
-        sessionId    = $sessionId
+        schema         = 3
+        sessionId      = $sessionId
+        renderedAt     = [int][double]::Parse((Get-Date -UFormat %s))   # epoch seconds (UTC); a NUMBER so ConvertFrom-Json won't coerce it to a culture-formatted [DateTime] on the read side
+        transcriptPath = $tpath
+        costBaseline   = $(if ($rollup) { $rollup.costBaseline } else { $null })
         model        = $model
         windowSize   = $ctxSize
         effort       = $effort
@@ -790,6 +1019,11 @@ try {
         freshLegUsd  = $freshBaseline
         lastLegUsd   = $(if ($rollup) { $rollup.lastLegCost } else { $null })
         nLegs        = $(if ($rollup) { [int]$rollup.nLegs } else { $null })
+        nColdLegs        = $(if ($rollup) { [int]$rollup.nColdLegs } else { $null })
+        coldWastedUsd    = $(if ($rollup -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) { [Math]::Round(([double]$sessionCost / [double]$rollup.sumUnits) * [double]$rollup.coldWastedUnits, 2) } else { $null })
+        coldStakeUsd      = $coldStakeUsd
+        coldState         = $coldState
+        coldCoolRemainSec = $coldCoolRemainSec
         legCosts     = @($perLegCostArr | ForEach-Object { [Math]::Round([double]$_, 4) })
         aliveSec     = $aliveSec
         apiSec       = $apiSec
@@ -799,16 +1033,32 @@ try {
         tps          = $(if ($null -ne $tps) { [int]$tps } else { $null })
         gitRepo      = $repo
     }
-    $snapshot | ConvertTo-Json -Depth 5 -Compress | Out-File -FilePath "$ClaudeHome/.claude/statusline-last.json" -Encoding utf8 -Force
+    # Dual write (see docs/status-line.md → Sidecar). PRIMARY is project-local
+    # (<cwd>/.claude/statusline-last.json) so concurrent sessions in different projects stop
+    # clobbering each other's snapshot; the GLOBAL home file is kept as a fallback (first render
+    # before the project file exists) and as the most-recently-rendered-across-all marker.
+    $json = $snapshot | ConvertTo-Json -Depth 5 -Compress
+    if ($cwd) {
+        $projDir = Join-Path $cwd '.claude'
+        if (-not (Test-Path -LiteralPath $projDir)) { New-Item -ItemType Directory -Force -Path $projDir | Out-Null }
+        $json | Out-File -FilePath (Join-Path $projDir 'statusline-last.json') -Encoding utf8 -Force
+    }
+    $json | Out-File -FilePath "$ClaudeHome/.claude/statusline-last.json" -Encoding utf8 -Force
 } catch {}
+
+# Session line (alive/api · lines · turn TPS) is HIDDEN per Florian (rarely read). $line5 is still
+# BUILT above — and its $aliveSec/$apiSec feed the sidecar's activityPct — so this only suppresses
+# DISPLAY, code intact. Flip $ShowSessionLine to $true to restore.
+$ShowSessionLine = $false
 
 $out = @()
 $out += $line1
 if ($line2)    { $out += $line2 }
-if ($line4)    { $out += $line4 }
+foreach ($q in $qLines) { if ($q) { $out += $q } }   # quota: 0–2 per-window pace-gauge lines
 if ($line3)    { $out += $line3 }
+if ($coldLine) { $out += $coldLine }                 # cold-cache stats line, directly under cost
 if ($legsLine) { $out += $legsLine }
-if ($line5)    { $out += $line5 }
+if ($line5 -and $ShowSessionLine) { $out += $line5 }
 if ($gitLine)  { $out += $gitLine }
 
 [Console]::Out.Write(($out -join "`n"))
