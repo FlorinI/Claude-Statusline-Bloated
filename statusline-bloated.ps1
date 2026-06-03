@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '3.1.1.2'
+$SlVersion = '4.0.0.0'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -490,6 +490,116 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
     return $r
 }
 
+# Seconds between full sub-agent directory walks. The aggregate fleet KPIs tolerate a few seconds of
+# lag (D2 — agents are watched in aggregate, never per-leg), so we don't re-walk on every idle render.
+$AGENT_SCAN_THROTTLE = 15
+
+# Sub-agent cost rollup (Solution A — see docs/agent-cost-accounting.md). Claude Code folds every
+# spawned sub-agent's cost into the session's total_cost_usd, but their transcripts live OUTSIDE the
+# main file, under <transcript-minus-.jsonl>/subagents/** — both Task/Agent-tool agents directly in
+# subagents/ AND workflow agents under subagents/workflows/wf_*/. So the main scan's sumUnits counts
+# only main legs while total_cost includes agents → base = sessionCost / main_units inflates every
+# per-leg $ by (total_units / main_units). This scans the agent transcripts incrementally (per-file
+# byte offsets cached in <sessionId>.agents.json, like the main scan — a finished agent's file is read
+# once; throttled walk) and returns the agent unit total + aggregate KPIs, so base can be taken over
+# the COMBINED unit pool (de-inflated) and the fleet shown separately. Returns $null when no sub-agents
+# exist (the common case → cheap Test-Path skip). The transcripts are local (~/.claude/projects), so the
+# only cost is the directory walk, which the throttle bounds.
+function UpdateAgentRollups($sessionId, $tpath, $projRoot) {
+    if (-not $sessionId -or -not $tpath) { return $null }
+    $subDir = ($tpath -replace '\.jsonl$', '') + [IO.Path]::DirectorySeparatorChar + 'subagents'
+    if (-not (Test-Path -LiteralPath $subDir)) { return $null }
+    $statsDir = if ($projRoot) { Join-Path $projRoot '.claude\statusline-stats' } else { Join-Path $ClaudeHome '.claude\statusline-stats' }
+    try { if (-not (Test-Path -LiteralPath $statsDir)) { New-Item -ItemType Directory -Force -Path $statsDir | Out-Null } } catch {}
+    $cachePath = Join-Path $statsDir ($sessionId + '.agents.json')
+    $cache = $null
+    if (Test-Path -LiteralPath $cachePath) {
+        try { $cache = Get-Content $cachePath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json } catch {}
+    }
+    if ($null -eq $cache -or $cache.PSObject.Properties.Match('agents').Count -eq 0) {
+        $cache = [pscustomobject]@{ lastScanTs = [int]0; agents = @() }
+    }
+    if ($null -eq $cache.agents) { $cache.agents = @() }
+    $nowEpoch = [int][double]::Parse((Get-Date -UFormat %s))
+    # path -> entry lookup from the cached array (one entry per agent transcript).
+    $byPath = @{}
+    foreach ($a in @($cache.agents)) { if ($a -and $a.path) { $byPath[[string]$a.path] = $a } }
+    $doScan = (@($cache.agents).Count -eq 0) -or (($nowEpoch - [int]$cache.lastScanTs) -ge $AGENT_SCAN_THROTTLE)
+    if ($doScan) {
+        try {
+            $files = Get-ChildItem -LiteralPath $subDir -Recurse -Filter 'agent-*.jsonl' -File -ErrorAction SilentlyContinue
+            foreach ($f in $files) {
+                $key = $f.FullName
+                $e = $byPath[$key]
+                if (-not $e) {
+                    $e = [pscustomobject]@{ path = $key; offset = [long]0; units = [double]0; ownUnits = [double]0; legs = [int]0; out = [long]0; maxCtx = [int]0; lastMsgId = '' }
+                    $byPath[$key] = $e
+                }
+                # File shrank (rotated) → reprocess from the start.
+                if ([long]$e.offset -gt $f.Length) { $e.offset = 0; $e.units = 0; $e.ownUnits = 0; $e.legs = 0; $e.out = 0; $e.maxCtx = 0; $e.lastMsgId = '' }
+                if ([long]$e.offset -lt $f.Length) {
+                    $fs = $null
+                    try {
+                        $fs = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
+                        $fs.Seek([long]$e.offset, 'Begin') | Out-Null
+                        $remaining = $f.Length - [long]$e.offset
+                        $buf = New-Object byte[] $remaining
+                        $null = $fs.Read($buf, 0, $remaining)
+                        $txt = [System.Text.Encoding]::UTF8.GetString($buf)
+                        $lastNl = $txt.LastIndexOf("`n")
+                        if ($lastNl -ge 0) {
+                            $proc = $txt.Substring(0, $lastNl + 1)
+                            $consumed = [System.Text.Encoding]::UTF8.GetByteCount($proc)
+                            foreach ($line in ($proc -split "`n")) {
+                                $line = $line.Trim()
+                                if (-not $line) { continue }
+                                if ($line -notmatch '"type"\s*:\s*"assistant"') { continue }
+                                try {
+                                    $p = $line | ConvertFrom-Json
+                                    if ($p.type -ne 'assistant') { continue }
+                                    $mid = $p.message.id
+                                    if (-not $mid -or $mid -eq $e.lastMsgId) { continue }
+                                    $u = $p.message.usage
+                                    if (-not $u) { continue }
+                                    $inTok = [int]$u.input_tokens; $cwTok = [int]$u.cache_creation_input_tokens; $crTok = [int]$u.cache_read_input_tokens; $outTok = [int]$u.output_tokens
+                                    $e.units    = [double]$e.units + ($inTok * $M_INPUT + $cwTok * $M_CACHE_WRITE + $crTok * $M_CACHE_READ + $outTok * $M_OUTPUT)
+                                    $e.ownUnits = [double]$e.ownUnits + ($inTok * $M_INPUT + $cwTok * $M_CACHE_WRITE + $outTok * $M_OUTPUT)
+                                    $e.legs     = [int]$e.legs + 1
+                                    $e.out      = [long]$e.out + $outTok
+                                    $ctx = $inTok + $cwTok + $crTok
+                                    if ($ctx -gt [int]$e.maxCtx) { $e.maxCtx = $ctx }
+                                    $e.lastMsgId = $mid
+                                } catch {}
+                            }
+                            $e.offset = [long]$e.offset + $consumed
+                        }
+                    } catch {}
+                    finally { if ($fs) { try { $fs.Close() } catch {} } }
+                }
+            }
+            $cache.lastScanTs = $nowEpoch
+            $cache.agents = @($byPath.Values)
+            try { $cache | ConvertTo-Json -Depth 6 | Out-File -FilePath $cachePath -Encoding utf8 -Force } catch {}
+        } catch {}
+    }
+    # Aggregate the fleet KPIs from the (possibly throttle-stale) cache. Only count agents with ≥1 leg.
+    $live = @($cache.agents | Where-Object { $_ -and [int]$_.legs -gt 0 })
+    if ($live.Count -eq 0) { return $null }
+    $sumUnits = 0.0; $sumLegs = 0; $sumOut = 0; $sumMaxCtx = 0; $maxCtx = 0; $maxUnits = 0.0; $ctxList = @()
+    foreach ($a in $live) {
+        $sumUnits += [double]$a.units; $sumLegs += [int]$a.legs; $sumOut += [long]$a.out
+        $sumMaxCtx += [int]$a.maxCtx; $ctxList += [int]$a.maxCtx
+        if ([int]$a.maxCtx -gt $maxCtx)    { $maxCtx = [int]$a.maxCtx }
+        if ([double]$a.units -gt $maxUnits) { $maxUnits = [double]$a.units }
+    }
+    $ctxSorted = @($ctxList | Sort-Object)
+    $medCtx = $ctxSorted[[int][Math]::Floor($ctxSorted.Count / 2)]
+    return [pscustomobject]@{
+        nAgents = $live.Count; sumUnits = $sumUnits; sumLegs = $sumLegs; sumOut = $sumOut
+        sumMaxCtx = $sumMaxCtx; medCtx = $medCtx; maxCtx = $maxCtx; maxUnits = $maxUnits
+    }
+}
+
 # === Cluster 1: model + flags ===
 $model    = if ($d.model.display_name) { $d.model.display_name } else { 'unknown' }
 $version  = $d.version
@@ -587,19 +697,36 @@ if ($rollup -and $rollup.PSObject.Properties.Match('costBaseline').Count -gt 0 -
     $sessionCost = [double]$costUsd - [double]$rollup.costBaseline
     if ($sessionCost -lt 0) { $sessionCost = 0 }
 }
-# Per-leg dollar costs = stored per-leg cost units × base (= session_cost / sumUnits).
+# Sub-agent units (Solution A — docs/agent-cost-accounting.md): total_cost_usd includes every spawned
+# sub-agent's cost, but their units live OUTSIDE the main transcript. Fold them into the denominator so
+# base reflects the COMBINED pool — otherwise base = sessionCost / main_units inflates every per-leg $ by
+# (total/main) in agent-heavy sessions. $agentAgg is $null (→ agentUnits 0 → de-inflation is a no-op) when
+# there are no sub-agents, so sessions without agents are byte-for-byte unchanged.
+$agentAgg = $null
+if ($sessionId -and $tpath) { try { $agentAgg = UpdateAgentRollups $sessionId $tpath $cwd } catch {} }
+$agentUnits = if ($agentAgg) { [double]$agentAgg.sumUnits } else { 0.0 }
+$mainUnits  = if ($rollup)   { [double]$rollup.sumUnits } else { 0.0 }
+$totalUnits = $mainUnits + $agentUnits
+# Split the session spend main vs agents (feeds the agents cluster). base is taken over $totalUnits
+# everywhere below, so the main per-leg / sparkline / fresh / cold-tax numbers come out de-inflated.
+$agentsUsd = $null; $mainSessionUsd = $null
+if ($totalUnits -gt 0 -and $sessionCost -gt 0) {
+    $mainSessionUsd = ([double]$sessionCost / $totalUnits) * $mainUnits
+    $agentsUsd      = ([double]$sessionCost / $totalUnits) * $agentUnits
+}
+# Per-leg dollar costs = stored per-leg cost units × base (= session_cost / total_units, agents folded in).
 # Composition-weighted, so cache-heavy legs price correctly (cheap, not a token-count
 # spike), the bar sums to session_cost exactly, and — because base is flat over the
 # session — it does NOT drift down as cache reads accumulate. Feeds the sparkline (cluster 5).
 $perLegCostArr = @()
 $nextPart = $null   # forecast chip, assembled below — appended AFTER last-leg so the line reads $total | last leg | next …
 if ($rollup -and $null -ne $rollup.perLegUnits -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
-    $base = [double]$sessionCost / [double]$rollup.sumUnits
+    $base = [double]$sessionCost / $totalUnits
     $perLegCostArr = @($rollup.perLegUnits | ForEach-Object { [double]$base * [double]$_ })
 }
 if ($rollup -and $sessionCost -gt 0 -and [int]$rollup.nLegs -gt 0 `
         -and [double]$rollup.sumUnits -gt 0 -and $null -ne $ctxTok -and $ctxTok -gt 0) {
-    $base = [double]$sessionCost / [double]$rollup.sumUnits
+    $base = [double]$sessionCost / $totalUnits
     # Ambitious next-leg forecast (Option C): an EXACT floor — re-reading the current
     # context as a cache hit, priced at 0.10× (M_CACHE_READ × ctx_tokens) — plus a robust
     # own-work estimate (trailing median of the last ≤5 legs' own-work units, so one fat-
@@ -657,7 +784,7 @@ $coldRecent = $false   # set true when a cold leg landed within the last $RECENT
 $RECENT_COLD_WINDOW = 8   # "recent" = cold leg in the last N legs (≈ the sparkline span); tune here
 # Retrospective: tax (% of the displayed $total) + cold-leg share — shown once ≥1 cold leg recorded.
 if ($rollup -and [int]$rollup.nColdLegs -ge 1 -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
-    $coldTax = ([double]$sessionCost / [double]$rollup.sumUnits) * [double]$rollup.coldWastedUnits
+    $coldTax = ([double]$sessionCost / $totalUnits) * [double]$rollup.coldWastedUnits
     $nCold   = [int]$rollup.nColdLegs
     $taxPct  = if ($null -ne $costUsd -and [double]$costUsd -gt 0) { [int][Math]::Round(100.0 * $coldTax / [double]$costUsd) } else { 0 }
     $nL      = [int]$rollup.nLegs
@@ -678,7 +805,7 @@ if ($rollup -and [int]$rollup.nColdLegs -ge 1 -and [double]$rollup.sumUnits -gt 
 }
 # Prospective: the EXTRA $ the next leg pays to re-create the context cold (avoidable units × base).
 if ($rollup -and $null -ne $ctxTok -and $ctxTok -gt 0 -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
-    $coldBase   = [double]$sessionCost / [double]$rollup.sumUnits
+    $coldBase   = [double]$sessionCost / $totalUnits
     $coldStakes = $coldBase * [double]$ctxTok * ($M_CACHE_WRITE - $M_CACHE_READ)
     if ($coldStakes -ge 0.25) {
         $stakesStr = '+$' + ('{0:N2}' -f $coldStakes)   # leading + = cost ADDED on top of a normal leg
@@ -863,6 +990,25 @@ if ($perLegCostArr.Count -gt 0) {
     $legsLine = (Dim $legLabel) + (Dim '[old] ') + ($cells -join '') + (Dim ' [new]') + (Dim " ($n)")
 }
 
+# === Cluster 5b: sub-agent fleet (event-gated — only when sub-agents exist) ===
+# Separate from the main cost line by design (D1/D2 in docs/agent-cost-accounting.md): the main session
+# is watched for Florian's own drift/bloat (a failure mode agents don't have); agents are watched as an
+# AGGREGATE fleet — count · total context (median·max per agent) · cost (+ share) · depth — never per-leg.
+# Agents never go cold (they run to completion), so there's no cold line here.
+$agentsLine = $null
+if ($agentAgg -and [int]$agentAgg.nAgents -gt 0) {
+    $aParts = @()
+    $aParts += [string][int]$agentAgg.nAgents
+    $aParts += (Dim 'Σctx ') + (FmtNum ([int]$agentAgg.sumMaxCtx)) + (Dim (' (med ' + (FmtNum ([int]$agentAgg.medCtx)) + '·max ' + (FmtNum ([int]$agentAgg.maxCtx)) + ')'))
+    if ($null -ne $agentsUsd) {
+        $shareStr = if ($sessionCost -gt 0) { ' (' + [int][Math]::Round(100.0 * [double]$agentsUsd / [double]$sessionCost) + '%)' } else { '' }
+        $aParts += (ColorCost $agentsUsd ('$' + ('{0:N2}' -f [double]$agentsUsd))) + (Dim $shareStr)
+    }
+    $avgLegs = if ([int]$agentAgg.nAgents -gt 0) { [double]$agentAgg.sumLegs / [int]$agentAgg.nAgents } else { 0 }
+    $aParts += (Dim (('{0:N1}' -f $avgLegs) + ' legs/ag'))
+    $agentsLine = (Dim 'agents: ') + ($aParts -join $DIM_SEP)
+}
+
 # === Cluster 4: quota (per-window vertical-bar pace gauges) ===
 # Each window (5h, 7d) gets its OWN line, shown only when that window is ≥50% consumed (event-driven —
 # most sessions never surface it). Two adjacent block-bars (left=consumed/quota, right=elapsed/time);
@@ -888,7 +1034,15 @@ function QuotaLine($label, $rl, $winSec) {
     $absSev  = if ($consumed -ge 90) { 2 } elseif ($consumed -ge 70) { 1 } else { 0 }
     $sev = [Math]::Max($paceSev, $absSev)
     $col = if ($sev -ge 2) { '1;31' } elseif ($sev -eq 1) { '38;5;220' } else { '38;5;40' }
-    $verdict = if ($consumed -ge 90) { 'near cap' }
+    # used_percentage comes straight from rate_limits and CAN exceed 100 (the API reports overage
+    # as >100 once past the subscription window → on pay-per-use usage credits). "near cap" reads as
+    # "approaching" and is wrong once crossed, so ≥100 gets its own rung that quantifies the overage
+    # (the "+N%" reconciles with the displayed N%q — e.g. 112%q → cap +12%). absSev already paints it red.
+    $verdict = if ($consumed -ge 100) {
+            $over = [int][Math]::Round($consumed - 100)
+            if ($over -ge 1) { "cap +$over%" } else { 'at cap' }
+        }
+        elseif ($consumed -ge 90) { 'near cap' }
         elseif ($null -eq $gap) { '' }
         elseif ($gap -gt 5) { 'over ' + [int][Math]::Round($gap) + '% gap' }
         elseif ($gap -lt -5) { 'under ' + [int][Math]::Round(-$gap) + '% gap' }
@@ -1052,7 +1206,7 @@ try {
         lastLegUsd   = $(if ($rollup) { $rollup.lastLegCost } else { $null })
         nLegs        = $(if ($rollup) { [int]$rollup.nLegs } else { $null })
         nColdLegs        = $(if ($rollup) { [int]$rollup.nColdLegs } else { $null })
-        coldWastedUsd    = $(if ($rollup -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) { [Math]::Round(([double]$sessionCost / [double]$rollup.sumUnits) * [double]$rollup.coldWastedUnits, 2) } else { $null })
+        coldWastedUsd    = $(if ($rollup -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) { [Math]::Round(([double]$sessionCost / $totalUnits) * [double]$rollup.coldWastedUnits, 2) } else { $null })
         coldStakeUsd      = $coldStakeUsd
         coldState         = $coldState
         coldCoolRemainSec = $coldCoolRemainSec
@@ -1063,6 +1217,11 @@ try {
         linesAdded   = $d.cost.total_lines_added
         linesRemoved = $d.cost.total_lines_removed
         tps          = $(if ($null -ne $tps) { [int]$tps } else { $null })
+        nAgents        = $(if ($agentAgg) { [int]$agentAgg.nAgents } else { $null })
+        agentsUsd      = $(if ($null -ne $agentsUsd) { [Math]::Round([double]$agentsUsd, 2) } else { $null })
+        mainSessionUsd = $(if ($null -ne $mainSessionUsd) { [Math]::Round([double]$mainSessionUsd, 2) } else { $null })
+        agentLegs      = $(if ($agentAgg) { [int]$agentAgg.sumLegs } else { $null })
+        agentCtxMax    = $(if ($agentAgg) { [int]$agentAgg.maxCtx } else { $null })
         gitRepo      = $repo
     }
     # Dual write (see docs/status-line.md → Sidecar). PRIMARY is project-local
@@ -1090,6 +1249,7 @@ foreach ($q in $qLines) { if ($q) { $out += $q } }   # quota: 0–2 per-window p
 if ($line3)    { $out += $line3 }
 if ($coldLine) { $out += $coldLine }                 # cold-cache stats line, directly under cost
 if ($legsLine) { $out += $legsLine }
+if ($agentsLine) { $out += $agentsLine }             # sub-agent fleet (event-gated, only when agents exist)
 if ($line5 -and $ShowSessionLine) { $out += $line5 }
 if ($gitLine)  { $out += $gitLine }
 
