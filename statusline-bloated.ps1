@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '3.1.0'
+$SlVersion = '3.1.1.2'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -259,6 +259,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             lastLegTs        = $null   # epoch sec of the most recent leg (cold-cache gap detector + idle countdown anchor)
             nColdLegs        = [int]0     # legs that hit a cold cache re-create after an idle gap
             coldWastedUnits  = [double]0  # avoidable cost units burned on cold re-caches (cw × (1.25-0.10))
+            lastColdLegIdx   = [int]0     # nLegs index of the most recent cold leg (recency: surface a fresh tax)
         }
     }
     # Migration shim (Option C schema). If ANY required field is absent — an older
@@ -304,6 +305,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             lastLegTs        = $null
             nColdLegs        = [int]0
             coldWastedUnits  = [double]0
+            lastColdLegIdx   = [int]0
         }
     }
     if ($null -eq $r.perLegUnits)    { $r.perLegUnits = @() }
@@ -313,6 +315,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
     if ($r.PSObject.Properties.Match('lastLegTs').Count -eq 0)       { $r | Add-Member -NotePropertyName lastLegTs -NotePropertyValue $null }
     if ($r.PSObject.Properties.Match('nColdLegs').Count -eq 0)       { $r | Add-Member -NotePropertyName nColdLegs -NotePropertyValue ([int]0) }
     if ($r.PSObject.Properties.Match('coldWastedUnits').Count -eq 0) { $r | Add-Member -NotePropertyName coldWastedUnits -NotePropertyValue ([double]0) }
+    if ($r.PSObject.Properties.Match('lastColdLegIdx').Count -eq 0)  { $r | Add-Member -NotePropertyName lastColdLegIdx -NotePropertyValue ([int]0) }
     $skipLastLegCost = $needsReset
     $nLegsBefore = [int]$r.nLegs
 
@@ -414,6 +417,8 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                             if ($gap -gt 300 -and $cwTok -ge 50000 -and $crTok -lt (0.5 * $cwTok)) {
                                 $r.nColdLegs       = [int]$r.nColdLegs + 1
                                 $r.coldWastedUnits = [double]$r.coldWastedUnits + ($cwTok * ($M_CACHE_WRITE - $M_CACHE_READ))
+                                $r.lastColdLegIdx  = [int]$r.nLegs   # this leg's index — for the "paid N legs ago" recency read
+
                             }
                         }
                         if ($null -ne $legTs) { $r.lastLegTs = $legTs }
@@ -648,13 +653,26 @@ $snow = "❆" + [char]0x2009   # thin-space (U+2009) padding between the marker 
 $coldParts = @()
 $coldMarkerCol = '2'   # ❆ marker colour: dim by default (retrospective-only / S0 runway), brightens with the cooling ramp
 $coldStakes = $null; $coldRemain = $null
+$coldRecent = $false   # set true when a cold leg landed within the last $RECENT_COLD_WINDOW legs (makes a fresh tax pop)
+$RECENT_COLD_WINDOW = 8   # "recent" = cold leg in the last N legs (≈ the sparkline span); tune here
 # Retrospective: tax (% of the displayed $total) + cold-leg share — shown once ≥1 cold leg recorded.
 if ($rollup -and [int]$rollup.nColdLegs -ge 1 -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
     $coldTax = ([double]$sessionCost / [double]$rollup.sumUnits) * [double]$rollup.coldWastedUnits
     $nCold   = [int]$rollup.nColdLegs
     $taxPct  = if ($null -ne $costUsd -and [double]$costUsd -gt 0) { [int][Math]::Round(100.0 * $coldTax / [double]$costUsd) } else { 0 }
-    $coldParts += (Dim 'tax ') + (Dim ($taxPct.ToString() + '% (')) + (ColorCost $coldTax ('$' + ('{0:N2}' -f $coldTax))) + (Dim ')')
     $nL      = [int]$rollup.nLegs
+    # Recency: how many legs ago the most recent cold leg landed. A dim cumulative tally hides a
+    # tax you JUST paid (it looks identical to one paid 200 legs back), so within the window we
+    # brighten the tax to blue + append a "just paid / N legs ago" tag. Stale → stays dim as before.
+    $lastColdIdx = if ($rollup.PSObject.Properties.Match('lastColdLegIdx').Count -gt 0) { [int]$rollup.lastColdLegIdx } else { 0 }
+    $legsAgo     = if ($lastColdIdx -gt 0) { $nL - $lastColdIdx } else { 9999 }
+    $coldRecent  = ($lastColdIdx -gt 0 -and $legsAgo -lt $RECENT_COLD_WINDOW)
+    if ($coldRecent) {
+        $recencyTag = if ($legsAgo -le 0) { 'just paid' } elseif ($legsAgo -eq 1) { '1 leg ago' } else { "$legsAgo legs ago" }
+        $coldParts += "${ESC}[38;5;33mtax ${taxPct}% (`$$('{0:N2}' -f $coldTax))${ESC}[0m" + [char]0x2002 + "${ESC}[1;38;5;33m$recencyTag${ESC}[0m"
+    } else {
+        $coldParts += (Dim 'tax ') + (Dim ($taxPct.ToString() + '% (')) + (ColorCost $coldTax ('$' + ('{0:N2}' -f $coldTax))) + (Dim ')')
+    }
     $legPct  = if ($nL -gt 0) { [int][Math]::Round(100.0 * $nCold / $nL) } else { 0 }
     $coldParts += (Dim "legs $nCold/$nL ($legPct%)")
 }
@@ -687,7 +705,7 @@ if ($rollup -and $null -ne $ctxTok -and $ctxTok -gt 0 -and [double]$rollup.sumUn
                 # Past the (minimum) TTL — stay NON-definitive: likely cold, but Anthropic's "not immediately
                 # deleted" slack means a send just past 5m can still hit warm. So "cold? >5m", not "cold now".
                 $coldMarkerCol = '38;5;33'
-                $coldParts += (ColdBlue 'cold') + "${ESC}[1;31m? >5m ${ESC}[0m" + (ColorLegCell $coldStakes $stakesStr)
+                $coldParts += (ColdBlue 'cold?') + "${ESC}[1;31m >5m ${ESC}[0m" + (ColorLegCell $coldStakes $stakesStr)
             }
         } else {
             $coldMarkerCol = '38;5;33'
@@ -695,6 +713,10 @@ if ($rollup -and $null -ne $ctxTok -and $ctxTok -gt 0 -and [double]$rollup.sumUn
         }
     }
 }
+# A cold tax paid within the last $RECENT_COLD_WINDOW legs lifts the ❆ marker from dim to blue even on
+# prospective runway (>4m → the cooling ramp leaves it dim), so a fresh hit draws the eye. The ramp can
+# still push it brighter (it runs above); we only raise the floor here.
+if ($coldRecent -and $coldMarkerCol -eq '2') { $coldMarkerCol = '38;5;33' }
 
 # Full-turn TPS anchored to the latest user-message timestamp.
 # Reads the last 2 MB of the transcript. If that tail doesn't contain a `type:user`
