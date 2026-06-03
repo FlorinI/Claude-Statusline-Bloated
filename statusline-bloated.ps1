@@ -4,6 +4,13 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $input_json = [Console]::In.ReadToEnd()
 $d = $input_json | ConvertFrom-Json
 
+# Status-line software version (OUR version, not Claude Code's). Rendered as a
+# trailing `bsl<ver>` badge on line 1 and logged per-row in the calibration samples
+# so every reading is anchored to the threshold regime that produced it. Bump on
+# any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
+# math, cold-cache logic). See docs/froz5-calibration-samples.md.
+$SlVersion = '3.1.0'
+
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
 
@@ -499,6 +506,9 @@ if ($null -ne $thinking) {
     $line1Parts += (Dim 'think:') + $val
 }
 if ($style -and $style -ne 'default') { $line1Parts += (Dim 'style:') + $style }
+# Trailing status-line-version badge ('bsl' = bloated status line; distinct from the
+# Claude Code 'v' next to the model). Dim, parked at the end of line 1.
+$line1Parts += (DarkGray "bsl$SlVersion")
 $line1 = $line1Parts -join $DIM_SEP
 
 # === Cluster 2: context window ===
