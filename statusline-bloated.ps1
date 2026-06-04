@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.1.1.0'
+$SlVersion = '4.1.1.1'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -855,19 +855,33 @@ if ($rollup -and $null -ne $ctxTok -and $ctxTok -gt 0 -and [double]$rollup.sumUn
             $nowEpoch   = [int][double]::Parse((Get-Date -UFormat %s))
             $coldRemain = $ttlSec - ($nowEpoch - [double]$rollup.lastLegTs)
             if ($coldRemain -gt 0) {
-                # Escalation ramp over the FINAL minutes before expiry — keyed to ABSOLUTE seconds-remaining,
-                # so it behaves identically whether the window is 5m or 1h (dim through the runway, then the
-                # same loud last-4-minutes ramp). Grabs attention while a SEND can still save the re-create.
-                # (The TTL is Anthropic's MINIMUM lifetime — entries are "promptly, though not immediately,
-                # deleted", so a send slightly past 0 can still hit a warm cache; conservative signal, not a
-                # guarantee. Each sent leg re-reads the cached prefix → resets the clock.)
-                $wCol = if ($coldRemain -gt 240) { '2' } else { '38;5;33' }                      # word 'cold': dim while >4m left, then deep blue
-                $tCol = if ($coldRemain -gt 240) { '2' } elseif ($coldRemain -gt 180) { '97' }   # timer: dim -> white
-                        elseif ($coldRemain -gt 120) { '38;5;220' }                              #        -> yellow
-                        elseif ($coldRemain -gt 60)  { '38;5;208' }                              #        -> orange
-                        else { '1;31' }                                                          #        -> red
-                $coldMarkerCol = $wCol   # ❆ marker tracks the cooling word: dim at S0, deep blue once urgency rises
-                $amt = if ($coldRemain -gt 180) { Dim $stakesStr } else { ColorLegCell $coldStakes $stakesStr }  # amount: dim until <3m left, then leg-cost gradient
+                # Escalation ramp — boundaries SCALE to the detected TTL window (all keyed to seconds-REMAINING,
+                # $coldRemain). On the 1h subscription cache the line stays calm for the first ~40 min (dim →
+                # deep-blue "visible" at 20 min idle), goes white at 40 min idle, then yellow/orange/red over the
+                # final 20 min — quiet two-thirds of an hour you'll rarely fully idle, loud only when the wall
+                # actually nears. On a 5m window it keeps the original tight last-4-minutes ramp. Grabs attention
+                # while a SEND can still save the re-create. (The TTL is Anthropic's MINIMUM lifetime — a send
+                # slightly past 0 can still hit warm; conservative signal. Each sent leg re-reads → resets the clock.)
+                if ($ttlSec -ge 3600) {
+                    # 1h window: dim → blue@40m-left (visible, 20 min idle) · white@20m · yellow@10m · orange@5m · red@2m
+                    $wCol = if ($coldRemain -gt 2400) { '2' } else { '38;5;33' }                     # word+marker: dim until 20m idle, then deep blue
+                    $tCol = if ($coldRemain -gt 2400) { '2' } elseif ($coldRemain -gt 1200) { '38;5;33' }   # timer: dim -> blue (visible, 20–40m left)
+                            elseif ($coldRemain -gt 600) { '97' }                                    #            -> white  (last 20 min)
+                            elseif ($coldRemain -gt 300) { '38;5;220' }                              #            -> yellow (last 10 min)
+                            elseif ($coldRemain -gt 120) { '38;5;208' }                              #            -> orange (last 5 min)
+                            else { '1;31' }                                                          #            -> red    (last 2 min)
+                    $amtBright = ($coldRemain -le 600)   # $ amount brightens in the last 10 min (yellow onward); dim through the calm blue/white phase
+                } else {
+                    # 5m (or other short) window: original tight ramp over the final 4 minutes
+                    $wCol = if ($coldRemain -gt 240) { '2' } else { '38;5;33' }                      # word+marker: dim while >4m left, then deep blue
+                    $tCol = if ($coldRemain -gt 240) { '2' } elseif ($coldRemain -gt 180) { '97' }   # timer: dim -> white
+                            elseif ($coldRemain -gt 120) { '38;5;220' }                              #        -> yellow
+                            elseif ($coldRemain -gt 60)  { '38;5;208' }                              #        -> orange
+                            else { '1;31' }                                                          #        -> red
+                    $amtBright = ($coldRemain -le 180)   # amount brightens in the last 3 min
+                }
+                $coldMarkerCol = $wCol   # ❆ marker tracks the cooling word: dim while calm, deep blue once visible
+                $amt = if ($amtBright) { ColorLegCell $coldStakes $stakesStr } else { Dim $stakesStr }  # amount: dim while calm, leg-cost gradient once at risk
                 $coldParts += "${ESC}[${wCol}mcold${ESC}[0m${ESC}[${tCol}m in $(FmtDuration ([int]$coldRemain)) ${ESC}[0m" + $amt
             } else {
                 # Past the (minimum) TTL — stay NON-definitive: likely cold, but Anthropic's "not immediately
