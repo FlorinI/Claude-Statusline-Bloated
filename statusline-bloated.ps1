@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.0.1.0'
+$SlVersion = '4.1.0.0'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -33,6 +33,22 @@ function FmtDuration($sec) {
     if ($sec -lt 3600)  { return ("{0}m{1:D2}s" -f [int][Math]::Floor($sec/60), ($sec % 60)) }
     if ($sec -lt 86400) { return ("{0}h{1:D2}m" -f [int][Math]::Floor($sec/3600), [int][Math]::Floor(($sec % 3600)/60)) }
     return ("{0}d{1:D2}h" -f [int][Math]::Floor($sec/86400), [int][Math]::Floor(($sec % 86400)/3600))
+}
+# Like FmtDuration but minute-granularity with zero sub-units suppressed — for the quota
+# line's runway/blackout estimates, where seconds are noise: "27m", "1h12m", "21h", "2d15h", "2d".
+function FmtDurShort($sec) {
+    if ($null -eq $sec) { return '--' }
+    $sec = [int][Math]::Floor([double]$sec)
+    if ($sec -lt 0) { $sec = 0 }
+    if ($sec -ge 86400) {
+        $d = [int][Math]::Floor($sec / 86400); $h = [int][Math]::Floor(($sec % 86400) / 3600)
+        return $(if ($h -eq 0) { "${d}d" } else { "${d}d${h}h" })
+    }
+    if ($sec -ge 3600) {
+        $h = [int][Math]::Floor($sec / 3600); $m = [int][Math]::Floor(($sec % 3600) / 60)
+        return $(if ($m -eq 0) { "${h}h" } else { "${h}h${m}m" })
+    }
+    return ("{0}m" -f [int][Math]::Round($sec / 60.0))
 }
 function Median($arr) {
     $vals = @($arr | Where-Object { $null -ne $_ } | Sort-Object)
@@ -1014,12 +1030,18 @@ if ($agentAgg -and [int]$agentAgg.nAgents -gt 0) {
     $agentsLine = (Dim 'agents: ') + ($aParts -join $DIM_SEP)
 }
 
-# === Cluster 4: quota (per-window vertical-bar pace gauges) ===
+# === Cluster 4: quota (per-window blackout-projection pace gauges) ===
 # Each window (5h, 7d) gets its OWN line, shown only when that window is ≥50% consumed (event-driven —
-# most sessions never surface it). Two adjacent block-bars (left=consumed/quota, right=elapsed/time);
-# full glyph height = 100%. BOTH bars + the verdict are coloured by the WORSE of {pace gap, absolute-
-# quota band}, so a near-cap window can't hide behind an "on pace" verdict. The %t (elapsed) lets
-# Florian compare burn against the clock at a glance.
+# most sessions never surface it). Layout: "<win> quota →NN%▄▅NN%← time | <verdict> | <detail> | resets".
+# Two block-bars (left=consumed/quota, right=elapsed/time; full glyph = 100%) sit BETWEEN the two numbers.
+# Severity projects the CURRENT cumulative pace forward to a quota blackout (q,t = consumed/elapsed fractions):
+#   beta = blackout as a fraction of the window = max(0, 1 - t/q)
+#   B    = beta * W       how long you'll be locked out
+#   S    = (t/q - t) * W  runway: real time before the blackout starts        (identity: S + B = time-to-reset)
+# Colour rides beta (scale-free — a small overshoot near the cap is a small blackout, so near-cap can't
+# false-alarm), bumped +1 rung when the ABSOLUTE blackout B ≥ 8h so a multi-hour 7d lockout can't wear a
+# calm colour. The detail field spells the two human numbers: "<S> to act → <B> dark". Bands (on beta):
+# q≤t green · ≤.10 yellow · ≤.25 orange · >.25 red; consumed ≥100% is an "exhausted" red override.
 $qBlocks = ' ',[char]0x2581,[char]0x2582,[char]0x2583,[char]0x2584,[char]0x2585,[char]0x2586,[char]0x2587,[char]0x2588
 $nowQ = [int][double]::Parse((Get-Date -UFormat %s))
 function QLvl($p) { $l = [int][Math]::Round($p / 100.0 * 8); if ($p -gt 0 -and $l -lt 1) { $l = 1 }; if ($l -gt 8) { $l = 8 }; return $l }
@@ -1033,33 +1055,61 @@ function QuotaLine($label, $rl, $winSec) {
         $elapsed = (($winSec - $remain) / $winSec) * 100.0
         if ($elapsed -lt 0) { $elapsed = 0 }; if ($elapsed -gt 100) { $elapsed = 100 }
     }
-    # Severity 0/1/2 = green/yellow/red. Pace = over-burn vs the clock; abs = proximity to the cap.
-    $gap = if ($null -ne $elapsed) { $consumed - $elapsed } else { $null }
-    $paceSev = if ($null -eq $gap) { 0 } elseif ($gap -gt 20) { 2 } elseif ($gap -gt 5) { 1 } else { 0 }
-    $absSev  = if ($consumed -ge 90) { 2 } elseif ($consumed -ge 70) { 1 } else { 0 }
-    $sev = [Math]::Max($paceSev, $absSev)
-    $col = if ($sev -ge 2) { '1;31' } elseif ($sev -eq 1) { '38;5;220' } else { '38;5;40' }
-    # used_percentage comes straight from rate_limits and CAN exceed 100 (the API reports overage
-    # as >100 once past the subscription window → on pay-per-use usage credits). "near cap" reads as
-    # "approaching" and is wrong once crossed, so ≥100 gets its own rung that quantifies the overage
-    # (the "+N%" reconciles with the displayed N%q — e.g. 112%q → cap +12%). absSev already paints it red.
-    $verdict = if ($consumed -ge 100) {
-            $over = [int][Math]::Round($consumed - 100)
-            if ($over -ge 1) { "cap +$over%" } else { 'at cap' }
+    $q = $consumed / 100.0
+    $t = if ($null -ne $elapsed) { $elapsed / 100.0 } else { $null }
+    $exhausted = ($consumed -ge 100)
+
+    # Project current cumulative pace forward to a blackout (see cluster header for the model).
+    $beta = $null; $B = $null; $S = $null
+    if ($null -ne $t -and $t -gt 0 -and -not $exhausted) {
+        $beta = [Math]::Max([double]0, 1.0 - ($t / $q))                       # blackout as fraction of window
+        $B    = $beta * $winSec                                               # blackout duration (sec)
+        $S    = if ($q -gt $t) { (($t / $q) - $t) * $winSec } else { [double]0 }  # runway / time-to-act (sec)
+    }
+
+    # Rung 0/1/2/3 = green/yellow/orange/red. beta drives it; absolute blackout bumps +1.
+    # When elapsed is unknown (no resets_at) fall back to absolute-consumed bands.
+    $rung =
+        if ($exhausted) { 3 }
+        elseif ($null -eq $beta) { if ($consumed -ge 90) { 3 } elseif ($consumed -ge 70) { 1 } else { 0 } }
+        elseif ($beta -le 0)    { 0 }
+        elseif ($beta -le 0.10) { 1 }
+        elseif ($beta -le 0.25) { 2 }
+        else                    { 3 }
+    if ($null -ne $B -and $B -ge 28800 -and $rung -lt 3) { $rung++ }          # +1 rung when blackout ≥ 8h
+    $col = switch ($rung) { 0 { '38;5;40' } 1 { '38;5;220' } 2 { '38;5;208' } default { '1;31' } }
+
+    # Verdict follows the FINAL rung (so a bumped line gets the louder words); detail spells the stakes.
+    # used_percentage can exceed 100 (API reports overage as >100 → pay-per-use usage credits), hence the
+    # exhausted override and the "+N%" that reconciles with the displayed NN% (e.g. 112% → +12%).
+    if ($exhausted) {
+        $over    = [int][Math]::Round($consumed - 100)
+        $verdict = if ($over -ge 1) { "quota exhausted - on usage +$over%" } else { 'quota exhausted' }
+        $detail  = 'dark until reset'
+    } else {
+        $verdict = switch ($rung) { 0 { 'you can keep this pace' } 1 { 'slow down just a bit' } 2 { 'slow down' } default { 'slow down hard' } }
+        if ($rung -eq 0 -and $null -ne $t -and $t -gt 0) {
+            $rho    = $q / $t                                                 # projected end consumption if pace holds
+            $detail = ('ends ~{0}% ' -f [int][Math]::Round($rho * 100)) + ([char]0x00B7) + (' {0}% spare' -f [int][Math]::Round((1 - $rho) * 100))
+        } elseif ($null -ne $B) {
+            $detail = (FmtDurShort $S) + ' to act ' + ([char]0x2192) + ' ' + (FmtDurShort $B) + ' dark'
+        } else {
+            $detail = $null
         }
-        elseif ($consumed -ge 90) { 'near cap' }
-        elseif ($null -eq $gap) { '' }
-        elseif ($gap -gt 5) { 'over ' + [int][Math]::Round($gap) + '% gap' }
-        elseif ($gap -lt -5) { 'under ' + [int][Math]::Round(-$gap) + '% gap' }
-        else { 'on pace' }
+    }
+
+    # Gauge: "<win> quota →NN%▄▅NN%← time" — bars between the numbers, arrows pointing inward.
     $cbar = $qBlocks[(QLvl $consumed)]
     $ebar = if ($null -ne $elapsed) { $qBlocks[(QLvl $elapsed)] } else { ' ' }
-    # consumed-LEFT order (Florian's pick); both bars share the severity colour.
-    $bars = "$ESC[${col}m$cbar$ebar$ESC[0m"
-    $etxt = $(if ($null -ne $elapsed) { [int][Math]::Round($elapsed) } else { '--' }).ToString()
-    $s = (Dim "$label ") + $bars + '  ' + "$ESC[${col}m$([int][Math]::Round($consumed))%q$ESC[0m" + (Dim '/') + (Dim ($etxt + '%t'))
-    if ($verdict) { $s += '  ' + "$ESC[${col}m$verdict$ESC[0m" }
-    if ($rl.resets_at) { $s += (Dim ('  resets ' + (FmtDuration ([int]([double]$rl.resets_at - $nowQ))))) }
+    $qn   = [int][Math]::Round($consumed)
+    $tn   = if ($null -ne $elapsed) { [int][Math]::Round($elapsed) } else { $null }
+    $mid  = ([char]0x2192) + "$qn%$cbar$ebar" + $(if ($null -ne $tn) { "$tn%" } else { '' }) + ([char]0x2190)
+    $gauge = (Dim "$label quota ") + "$ESC[${col}m$mid$ESC[0m" + (Dim ' time')
+
+    $s = $gauge
+    if ($verdict) { $s += $DIM_SEP + "$ESC[${col}m$verdict$ESC[0m" }
+    if ($detail)  { $s += $DIM_SEP + "$ESC[${col}m$detail$ESC[0m" }
+    if ($rl.resets_at) { $s += $DIM_SEP + (Dim ('resets ' + (FmtDurShort ([int]([double]$rl.resets_at - $nowQ))))) }
     return $s
 }
 $qLines = @()
