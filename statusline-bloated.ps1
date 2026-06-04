@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.0.0.0'
+$SlVersion = '4.0.1.0'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -709,10 +709,11 @@ $mainUnits  = if ($rollup)   { [double]$rollup.sumUnits } else { 0.0 }
 $totalUnits = $mainUnits + $agentUnits
 # Split the session spend main vs agents (feeds the agents cluster). base is taken over $totalUnits
 # everywhere below, so the main per-leg / sparkline / fresh / cold-tax numbers come out de-inflated.
-$agentsUsd = $null; $mainSessionUsd = $null
+$agentsUsd = $null; $mainSessionUsd = $null; $baseTrue = $null
 if ($totalUnits -gt 0 -and $sessionCost -gt 0) {
-    $mainSessionUsd = ([double]$sessionCost / $totalUnits) * $mainUnits
-    $agentsUsd      = ([double]$sessionCost / $totalUnits) * $agentUnits
+    $baseTrue       = [double]$sessionCost / $totalUnits
+    $mainSessionUsd = $baseTrue * $mainUnits
+    $agentsUsd      = $baseTrue * $agentUnits
 }
 # Per-leg dollar costs = stored per-leg cost units × base (= session_cost / total_units, agents folded in).
 # Composition-weighted, so cache-heavy legs price correctly (cheap, not a token-count
@@ -997,15 +998,19 @@ if ($perLegCostArr.Count -gt 0) {
 # Agents never go cold (they run to completion), so there's no cold line here.
 $agentsLine = $null
 if ($agentAgg -and [int]$agentAgg.nAgents -gt 0) {
+    # Legibility (Florian): every stat NUMBER renders at default foreground so it reads at a glance; only the
+    # LABELS / punctuation are dimmed, and the agent `$` keeps its bright cost-gradient. (Previously med/max,
+    # the share %, and legs/ag were fully dim and took too much effort to read — esp. the max-ctx fat-agent tell.)
     $aParts = @()
     $aParts += [string][int]$agentAgg.nAgents
-    $aParts += (Dim 'Σctx ') + (FmtNum ([int]$agentAgg.sumMaxCtx)) + (Dim (' (med ' + (FmtNum ([int]$agentAgg.medCtx)) + '·max ' + (FmtNum ([int]$agentAgg.maxCtx)) + ')'))
+    $aParts += (Dim 'Σctx ') + (FmtNum ([int]$agentAgg.sumMaxCtx)) + (Dim ' (med ') + (FmtNum ([int]$agentAgg.medCtx)) + (Dim '·max ') + (FmtNum ([int]$agentAgg.maxCtx)) + (Dim ')')
     if ($null -ne $agentsUsd) {
-        $shareStr = if ($sessionCost -gt 0) { ' (' + [int][Math]::Round(100.0 * [double]$agentsUsd / [double]$sessionCost) + '%)' } else { '' }
-        $aParts += (ColorCost $agentsUsd ('$' + ('{0:N2}' -f [double]$agentsUsd))) + (Dim $shareStr)
+        $costChip = (ColorCost $agentsUsd ('$' + ('{0:N2}' -f [double]$agentsUsd)))
+        if ($sessionCost -gt 0) { $costChip += (Dim ' (') + ([int][Math]::Round(100.0 * [double]$agentsUsd / [double]$sessionCost)).ToString() + (Dim '%)') }
+        $aParts += $costChip
     }
     $avgLegs = if ([int]$agentAgg.nAgents -gt 0) { [double]$agentAgg.sumLegs / [int]$agentAgg.nAgents } else { 0 }
-    $aParts += (Dim (('{0:N1}' -f $avgLegs) + ' legs/ag'))
+    $aParts += ('{0:N1}' -f $avgLegs) + (Dim ' legs/ag')
     $agentsLine = (Dim 'agents: ') + ($aParts -join $DIM_SEP)
 }
 
@@ -1217,6 +1222,7 @@ try {
         linesAdded   = $d.cost.total_lines_added
         linesRemoved = $d.cost.total_lines_removed
         tps          = $(if ($null -ne $tps) { [int]$tps } else { $null })
+        base           = $baseTrue
         nAgents        = $(if ($agentAgg) { [int]$agentAgg.nAgents } else { $null })
         agentsUsd      = $(if ($null -ne $agentsUsd) { [Math]::Round([double]$agentsUsd, 2) } else { $null })
         mainSessionUsd = $(if ($null -ne $mainSessionUsd) { [Math]::Round([double]$mainSessionUsd, 2) } else { $null })
