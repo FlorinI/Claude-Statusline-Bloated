@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.1.0.0'
+$SlVersion = '4.1.1.0'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -67,7 +67,7 @@ function Median($arr) {
 # yielding cost "units". The derived base ($/unit = total_cost / Σunits) is then flat,
 # and cache-heavy legs price correctly (cheap) instead of reading as spikes.
 $M_INPUT       = 1.0     # base input price
-$M_CACHE_WRITE = 1.25    # 5-min ephemeral cache creation (Claude Code default)
+$M_CACHE_WRITE = 1.25    # cache-creation weight. 1.25× = the 5m-write list ratio; a 1h write is list-priced 2×. Kept at 1.25× for now (a subscription's 1h cache is plan-included, so a flat weight under-attributes cold-leg cost only mildly — see the TTL detection in UpdateSessionRollups). Per-tier weighting (5m 1.25× / 1h 2× off the ephemeral split) is a tracked follow-up, deferred with the cost-apportionment question.
 $M_CACHE_READ  = 0.10    # cache hit
 $M_OUTPUT      = 5.0     # output : input for Opus/Sonnet/Haiku 4.x ($15/$75, $3/$15, $1/$5)
 
@@ -276,6 +276,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             nColdLegs        = [int]0     # legs that hit a cold cache re-create after an idle gap
             coldWastedUnits  = [double]0  # avoidable cost units burned on cold re-caches (cw × (1.25-0.10))
             lastColdLegIdx   = [int]0     # nLegs index of the most recent cold leg (recency: surface a fresh tax)
+            lastLegTtlSec    = [int]0     # cache TTL the most recent leg WROTE at, seconds: 3600 (1h, auto on a Claude subscription) / 300 (5m: API-key default, or a subscription pushed over-limit onto usage credits) / 0 = unknown. Sets the cold-gap threshold + idle countdown window so a 1h session isn't false-flagged cold at 5m.
         }
     }
     # Migration shim (Option C schema). If ANY required field is absent — an older
@@ -322,6 +323,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             nColdLegs        = [int]0
             coldWastedUnits  = [double]0
             lastColdLegIdx   = [int]0
+            lastLegTtlSec    = [int]0
         }
     }
     if ($null -eq $r.perLegUnits)    { $r.perLegUnits = @() }
@@ -332,6 +334,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
     if ($r.PSObject.Properties.Match('nColdLegs').Count -eq 0)       { $r | Add-Member -NotePropertyName nColdLegs -NotePropertyValue ([int]0) }
     if ($r.PSObject.Properties.Match('coldWastedUnits').Count -eq 0) { $r | Add-Member -NotePropertyName coldWastedUnits -NotePropertyValue ([double]0) }
     if ($r.PSObject.Properties.Match('lastColdLegIdx').Count -eq 0)  { $r | Add-Member -NotePropertyName lastColdLegIdx -NotePropertyValue ([int]0) }
+    if ($r.PSObject.Properties.Match('lastLegTtlSec').Count -eq 0)   { $r | Add-Member -NotePropertyName lastLegTtlSec -NotePropertyValue ([int]0) }
     $skipLastLegCost = $needsReset
     $nLegsBefore = [int]$r.nLegs
 
@@ -383,6 +386,14 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                         $cwTok  = [int]$u.cache_creation_input_tokens
                         $crTok  = [int]$u.cache_read_input_tokens
                         $outTok = [int]$u.output_tokens
+                        # Which cache TTL did this leg WRITE at? The transcript splits cache_creation into
+                        # ephemeral_1h / ephemeral_5m token counts. A Claude subscription auto-requests the
+                        # 1h TTL (free within-plan); API-key auth — or a subscription pushed over-limit onto
+                        # usage credits — falls to 5m. Read it rather than assume 5m. 0 = this leg wrote no
+                        # cache (leave the session's tracked tier unchanged).
+                        $legTtlSec = if ([int]$u.cache_creation.ephemeral_1h_input_tokens -gt 0) { 3600 }
+                                     elseif ([int]$u.cache_creation.ephemeral_5m_input_tokens -gt 0) { 300 }
+                                     else { 0 }
                         # Composition-weighted cost units (Option C): weight each token type
                         # by its public list-price ratio so the derived $/unit base is flat
                         # over the session. `units` = the leg's full cost; `ownUnits` = units
@@ -404,10 +415,14 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                         $r.perLegUnits    += $units
                         $r.perLegOwnUnits += $ownUnits
                         # Cold re-cache detection. The first leg after an idle gap longer than the
-                        # ~5-min ephemeral-cache TTL re-creates the WHOLE context at cache_write (1.25×)
+                        # ephemeral-cache TTL re-creates the WHOLE context at cache_write (1.25×)
                         # instead of cache_read (0.10×). Signature: a big cache_creation with almost no
-                        # cache_read, preceded by a >5-min gap (the gap rules out a legit big paste — that
-                        # keeps the prior context warm, so cache_read stays substantial). Avoidable waste =
+                        # cache_read, preceded by a gap longer than the TTL of the cache that expired (the
+                        # PRIOR leg's write tier — $r.lastLegTtlSec, 3600 on a subscription / 300 on 5m;
+                        # default 300 before any tier is known). Using the recorded tier rather than a
+                        # hardcoded 5m stops a 1h session being false-flagged cold for every 5–60-min gap.
+                        # The gap requirement rules out a legit big paste — that keeps the prior context
+                        # warm, so cache_read stays substantial. Avoidable waste =
                         # cw × (write − read) units. lastLegTs feeds the next leg's gap.
                         # Parse the leg's UTC timestamp to epoch seconds. ConvertFrom-Json (PS7) coerces the
                         # ISO-8601 "…Z" string to a [datetime] (Kind=Utc); [string]-ing that DROPS the offset,
@@ -430,7 +445,10 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                         }
                         if ($null -ne $legTs -and $null -ne $r.lastLegTs) {
                             $gap = [double]$legTs - [double]$r.lastLegTs
-                            if ($gap -gt 300 -and $cwTok -ge 50000 -and $crTok -lt (0.5 * $cwTok)) {
+                            # TTL that governed whether the PRIOR cache survived this gap = the prior leg's
+                            # write tier. Fall back to 300 only before any tier has been observed.
+                            $prevTtl = if ([int]$r.lastLegTtlSec -gt 0) { [int]$r.lastLegTtlSec } else { 300 }
+                            if ($gap -gt $prevTtl -and $cwTok -ge 50000 -and $crTok -lt (0.5 * $cwTok)) {
                                 $r.nColdLegs       = [int]$r.nColdLegs + 1
                                 $r.coldWastedUnits = [double]$r.coldWastedUnits + ($cwTok * ($M_CACHE_WRITE - $M_CACHE_READ))
                                 $r.lastColdLegIdx  = [int]$r.nLegs   # this leg's index — for the "paid N legs ago" recency read
@@ -438,6 +456,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                             }
                         }
                         if ($null -ne $legTs) { $r.lastLegTs = $legTs }
+                        if ($legTtlSec -gt 0) { $r.lastLegTtlSec = [int]$legTtlSec }   # remember the current cache regime for the next gap test + the prospective countdown
                     } catch {}
                 }
                 $r.lastByteOffset = [long]$r.lastByteOffset + $consumedBytes
@@ -829,14 +848,19 @@ if ($rollup -and $null -ne $ctxTok -and $ctxTok -gt 0 -and [double]$rollup.sumUn
         if ($null -ne $rollup.lastLegTs) {
             # Countdown anchored to the last ACTUAL leg's timestamp (the cache-TTL clock), NOT render
             # time — robust to idle re-renders and rollup resets (which would otherwise re-stamp "now").
+            # TTL window = the regime the recent legs actually WROTE at (3600 on a subscription's auto 1h
+            # cache, 300 on 5m); falls back to 300 before any tier is observed. This is what fixed the
+            # "cold in 4m11s" that fired ~56 min early on every 1h session.
+            $ttlSec     = if ($rollup.PSObject.Properties.Match('lastLegTtlSec').Count -gt 0 -and [int]$rollup.lastLegTtlSec -gt 0) { [int]$rollup.lastLegTtlSec } else { 300 }
             $nowEpoch   = [int][double]::Parse((Get-Date -UFormat %s))
-            $coldRemain = 300 - ($nowEpoch - [double]$rollup.lastLegTs)
+            $coldRemain = $ttlSec - ($nowEpoch - [double]$rollup.lastLegTs)
             if ($coldRemain -gt 0) {
-                # Escalation ramp across the 5-min cooling window: muted while there's runway, louder as
-                # the cache nears expiry so it grabs attention while a SEND can still save the re-create.
-                # (5 min is Anthropic's MINIMUM TTL — entries are "promptly, though not immediately,
-                # deleted", so a send slightly past 0 can still hit a warm cache; this is a conservative
-                # risk signal, not a guarantee. Each sent leg re-reads the cached prefix → resets the clock.)
+                # Escalation ramp over the FINAL minutes before expiry — keyed to ABSOLUTE seconds-remaining,
+                # so it behaves identically whether the window is 5m or 1h (dim through the runway, then the
+                # same loud last-4-minutes ramp). Grabs attention while a SEND can still save the re-create.
+                # (The TTL is Anthropic's MINIMUM lifetime — entries are "promptly, though not immediately,
+                # deleted", so a send slightly past 0 can still hit a warm cache; conservative signal, not a
+                # guarantee. Each sent leg re-reads the cached prefix → resets the clock.)
                 $wCol = if ($coldRemain -gt 240) { '2' } else { '38;5;33' }                      # word 'cold': dim while >4m left, then deep blue
                 $tCol = if ($coldRemain -gt 240) { '2' } elseif ($coldRemain -gt 180) { '97' }   # timer: dim -> white
                         elseif ($coldRemain -gt 120) { '38;5;220' }                              #        -> yellow
@@ -847,9 +871,11 @@ if ($rollup -and $null -ne $ctxTok -and $ctxTok -gt 0 -and [double]$rollup.sumUn
                 $coldParts += "${ESC}[${wCol}mcold${ESC}[0m${ESC}[${tCol}m in $(FmtDuration ([int]$coldRemain)) ${ESC}[0m" + $amt
             } else {
                 # Past the (minimum) TTL — stay NON-definitive: likely cold, but Anthropic's "not immediately
-                # deleted" slack means a send just past 5m can still hit warm. So "cold? >5m", not "cold now".
+                # deleted" slack means a send just past the mark can still hit warm. So "cold? >5m"/">1h",
+                # not "cold now". The label tracks the actual window so a 1h session reads ">1h", not ">5m".
+                $ttlLabel = if ($ttlSec -ge 3600) { '>1h' } else { '>5m' }
                 $coldMarkerCol = '38;5;33'
-                $coldParts += (ColdBlue 'cold?') + "${ESC}[1;31m >5m ${ESC}[0m" + (ColorLegCell $coldStakes $stakesStr)
+                $coldParts += (ColdBlue 'cold?') + "${ESC}[1;31m $ttlLabel ${ESC}[0m" + (ColorLegCell $coldStakes $stakesStr)
             }
         } else {
             $coldMarkerCol = '38;5;33'
@@ -1265,6 +1291,7 @@ try {
         coldStakeUsd      = $coldStakeUsd
         coldState         = $coldState
         coldCoolRemainSec = $coldCoolRemainSec
+        coldTtlSec        = $(if ($rollup -and $rollup.PSObject.Properties.Match('lastLegTtlSec').Count -gt 0 -and [int]$rollup.lastLegTtlSec -gt 0) { [int]$rollup.lastLegTtlSec } else { $null })   # cache TTL window the recent legs wrote at: 3600 (1h, subscription default) / 300 (5m) / null (unknown)
         legCosts     = @($perLegCostArr | ForEach-Object { [Math]::Round([double]$_, 4) })
         aliveSec     = $aliveSec
         apiSec       = $apiSec
