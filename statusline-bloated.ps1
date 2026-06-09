@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.1.4.0'
+$SlVersion = '4.1.7.1'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -102,6 +102,7 @@ function Orange($t)     { "${ESC}[38;5;208m$t${ESC}[0m" }
 function Magenta($t)    { "${ESC}[95m$t${ESC}[0m" }
 function BrightCyan($t) { "${ESC}[96m$t${ESC}[0m" }
 function DarkGray($t)   { "${ESC}[38;5;240m$t${ESC}[0m" }
+function DimWhite($t)   { "${ESC}[38;5;250m$t${ESC}[0m" }   # one step below white; calmest /handover-check advert flag (worst-minus-one bottom rung)
 function ColdBlue($t)   { "${ESC}[38;5;33m$t${ESC}[0m" }   # cold-cache marker — readable deep blue (256-color 33)
 function BoldBright($t) { "${ESC}[1;97m$t${ESC}[0m" }
 
@@ -293,6 +294,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             nColdLegs        = [int]0     # legs that hit a cold cache re-create after an idle gap
             coldWastedUnits  = [double]0  # avoidable cost units burned on cold re-caches (cw × (1.25-0.10))
             lastColdLegIdx   = [int]0     # nLegs index of the most recent cold leg (recency: surface a fresh tax)
+            lastColdWastedUnits = [double]0  # waste units of the MOST RECENT cold leg alone — for the "$X N legs ago" per-hit read (vs the cumulative coldWastedUnits)
             lastLegTtlSec    = [int]0     # cache TTL the most recent leg WROTE at, seconds: 3600 (1h, auto on a Claude subscription) / 300 (5m: API-key default, or a subscription pushed over-limit onto usage credits) / 0 = unknown. Sets the cold-gap threshold + idle countdown window so a 1h session isn't false-flagged cold at 5m.
         }
     }
@@ -340,6 +342,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             nColdLegs        = [int]0
             coldWastedUnits  = [double]0
             lastColdLegIdx   = [int]0
+            lastColdWastedUnits = [double]0
             lastLegTtlSec    = [int]0
         }
     }
@@ -351,6 +354,14 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
     if ($r.PSObject.Properties.Match('nColdLegs').Count -eq 0)       { $r | Add-Member -NotePropertyName nColdLegs -NotePropertyValue ([int]0) }
     if ($r.PSObject.Properties.Match('coldWastedUnits').Count -eq 0) { $r | Add-Member -NotePropertyName coldWastedUnits -NotePropertyValue ([double]0) }
     if ($r.PSObject.Properties.Match('lastColdLegIdx').Count -eq 0)  { $r | Add-Member -NotePropertyName lastColdLegIdx -NotePropertyValue ([int]0) }
+    if ($r.PSObject.Properties.Match('lastColdWastedUnits').Count -eq 0) {
+        # Back-fill for rollups whose cold leg was recorded before this field existed: with exactly one
+        # cold leg the per-hit waste IS the cumulative, so seed from it (a multi-cold-leg rollup can't be
+        # decomposed → 0, self-heals on the next cold leg). Without this the per-hit segment + the
+        # lastColdTaxUsd sidecar read "$0.00 N legs ago" while the cumulative tax is non-zero.
+        $seedLastCold = if ([int]$r.nColdLegs -eq 1) { [double]$r.coldWastedUnits } else { [double]0 }
+        $r | Add-Member -NotePropertyName lastColdWastedUnits -NotePropertyValue $seedLastCold
+    }
     if ($r.PSObject.Properties.Match('lastLegTtlSec').Count -eq 0)   { $r | Add-Member -NotePropertyName lastLegTtlSec -NotePropertyValue ([int]0) }
     $skipLastLegCost = $needsReset
     $nLegsBefore = [int]$r.nLegs
@@ -470,12 +481,14 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                             # write tier. Fall back to 300 only before any tier has been observed.
                             $prevTtl = if ([int]$r.lastLegTtlSec -gt 0) { [int]$r.lastLegTtlSec } else { 300 }
                             if ($gap -gt $prevTtl -and $cwTok -ge 50000 -and $crTok -lt (0.5 * $cwTok)) {
-                                $r.nColdLegs       = [int]$r.nColdLegs + 1
                                 # Waste = what this cold write actually cost (per-tier units) minus what the
                                 # same tokens would have cost had the cache stayed warm (a read). Using $cwUnits
                                 # keeps it exact even on a mixed-tier leg, and tracks the real 2×/1.25× write tier.
-                                $r.coldWastedUnits = [double]$r.coldWastedUnits + ($cwUnits - ($cwTok * $M_CACHE_READ))
-                                $r.lastColdLegIdx  = [int]$r.nLegs   # this leg's index — for the "paid N legs ago" recency read
+                                $thisColdWaste     = $cwUnits - ($cwTok * $M_CACHE_READ)
+                                $r.nColdLegs       = [int]$r.nColdLegs + 1
+                                $r.coldWastedUnits = [double]$r.coldWastedUnits + $thisColdWaste
+                                $r.lastColdWastedUnits = [double]$thisColdWaste   # THIS leg's waste ALONE — the "$X N legs ago" per-hit figure (cumulative lives in coldWastedUnits)
+                                $r.lastColdLegIdx  = [int]$r.nLegs   # this leg's index — for the "N legs ago" recency read
 
                             }
                         }
@@ -709,6 +722,30 @@ if ($null -ne $ctxUsed -and $null -ne $ctxSize) {
         $ctxParts += (RedBold 'to-compact NOW')
     }
 }
+# /handover-check advert — nudge the command once context leaves green on EITHER
+# quality axis: the absolute-rot band on the token count (≥128k = yellow) OR the
+# fill-cliff band on the % chip (≥50% = yellow). The ⚑ flag glyph is coloured by
+# Florian's "worst-minus-one" rule: level both axes to green0/yellow1/orange2/red3,
+# take worst=max(abs,fill); if BOTH axes sit at that same level show its colour,
+# else show one step cooler (worst-1). Ladder: red·orange·yellow·dim-white. The
+# command text stays dim so only the flag carries the signal. See docs/status-line.md.
+$absLvl  = if     ($null -eq $ctxUsed)     { 0 }
+           elseif ($ctxUsed -lt 128000)    { 0 } elseif ($ctxUsed -lt 256000) { 1 }
+           elseif ($ctxUsed -lt 500000)    { 2 } else { 3 }
+$fillLvl = if     ($null -eq $ctxPct)      { 0 }
+           elseif ($ctxPct  -lt 50)        { 0 } elseif ($ctxPct  -lt 70)     { 1 }
+           elseif ($ctxPct  -lt 85)        { 2 } else { 3 }
+$advWorst = [Math]::Max([int]$absLvl, [int]$fillLvl)
+if ($advWorst -ge 1 -and $ctxParts.Count -gt 0) {
+    $advLvl = if ($absLvl -eq $fillLvl) { $advWorst } else { $advWorst - 1 }
+    $advFlag = switch ($advLvl) {
+        3       { RedBold '⚑' }
+        2       { Orange  '⚑' }
+        1       { Yellow  '⚑' }
+        default { DimWhite '⚑' }
+    }
+    $ctxParts += $advFlag + (Dim ' /handover-check')
+}
 $line2 = if ($ctxParts.Count -gt 0) { $ctxParts -join $DIM_SEP } else { $null }
 
 # === Cluster 3: cost density (five numbers, three groups) ===
@@ -843,24 +880,43 @@ $coldMarkerCol = '2'   # ❆ marker colour: dim by default (retrospective-only /
 $coldStakes = $null; $coldRemain = $null; $coldBand = $null   # resolved cold urgency+frame for the /handover-check sidecar (none|calm|heads-up|act-soon|urgent|expired); set in the ramp below
 $coldRecent = $false   # set true when a cold leg landed within the last $RECENT_COLD_WINDOW legs (makes a fresh tax pop)
 $RECENT_COLD_WINDOW = 8   # "recent" = cold leg in the last N legs (≈ the sparkline span); tune here
-# Retrospective: tax (% of the displayed $total) + cold-leg share — shown once ≥1 cold leg recorded.
+# Retrospective cold-cache tax. Two truths kept SEPARATE so neither masquerades as the other:
+#   • cumulative   — tax % + total $ across ALL cold legs (the running bill), always shown;
+#   • most-recent  — THIS cold leg's OWN $ tax + how many legs ago it landed (a discrete event),
+#                    shown only while recent.
+# The old single chip glued the cumulative $ onto the recency tag, so "($12.85) 7 legs ago" misread
+# as a $12.85 charge 7 legs back. Now recency qualifies the per-hit $ — a figure it can honestly own —
+# while the cumulative stands on its own. Shown once ≥1 cold leg recorded.
 if ($rollup -and [int]$rollup.nColdLegs -ge 1 -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) {
-    $coldTax = ([double]$sessionCost / $totalUnits) * [double]$rollup.coldWastedUnits
+    $coldBaseRate = [double]$sessionCost / $totalUnits
+    $coldTax = $coldBaseRate * [double]$rollup.coldWastedUnits
     $nCold   = [int]$rollup.nColdLegs
     $taxPct  = if ($null -ne $costUsd -and [double]$costUsd -gt 0) { [int][Math]::Round(100.0 * $coldTax / [double]$costUsd) } else { 0 }
     $nL      = [int]$rollup.nLegs
-    # Recency: how many legs ago the most recent cold leg landed. A dim cumulative tally hides a
-    # tax you JUST paid (it looks identical to one paid 200 legs back), so within the window we
-    # brighten the tax to blue + append a "just paid / N legs ago" tag. Stale → stays dim as before.
+    # Segment 1 — cumulative tax (always). Dim label; the $ carries the cost gradient (no longer pops
+    # blue on recency — that's the per-hit segment's job now).
+    $coldParts += (Dim 'tax ') + (Dim ($taxPct.ToString() + '% (')) + (ColorCost $coldTax ('$' + ('{0:N2}' -f $coldTax))) + (Dim ')')
+    # Segment 2 — most-recent cold leg: its OWN $ tax + recency, in blue. A dim cumulative tally hides a
+    # hit you JUST took (a $2 cold re-create reads identical to one 200 legs back), so within the window
+    # we surface the per-hit $ with a "just paid / N legs ago" tag. Stale → segment dropped entirely.
     $lastColdIdx = if ($rollup.PSObject.Properties.Match('lastColdLegIdx').Count -gt 0) { [int]$rollup.lastColdLegIdx } else { 0 }
     $legsAgo     = if ($lastColdIdx -gt 0) { $nL - $lastColdIdx } else { 9999 }
     $coldRecent  = ($lastColdIdx -gt 0 -and $legsAgo -lt $RECENT_COLD_WINDOW)
     if ($coldRecent) {
-        $recencyTag = if ($legsAgo -le 0) { 'just paid' } elseif ($legsAgo -eq 1) { '1 leg ago' } else { "$legsAgo legs ago" }
-        $coldParts += "${ESC}[38;5;33mtax ${taxPct}% (`$$('{0:N2}' -f $coldTax))${ESC}[0m" + [char]0x2002 + "${ESC}[1;38;5;33m$recencyTag${ESC}[0m"
-    } else {
-        $coldParts += (Dim 'tax ') + (Dim ($taxPct.ToString() + '% (')) + (ColorCost $coldTax ('$' + ('{0:N2}' -f $coldTax))) + (Dim ')')
+        $lastColdUnits = if ($rollup.PSObject.Properties.Match('lastColdWastedUnits').Count -gt 0) { [double]$rollup.lastColdWastedUnits } else { 0.0 }
+        # Defensive recovery: a cold leg recorded before lastColdWastedUnits existed can carry 0 here; for
+        # a single cold leg the cumulative IS the per-hit, so recover it rather than render $0.00.
+        if ($lastColdUnits -le 0 -and $nCold -eq 1) { $lastColdUnits = [double]$rollup.coldWastedUnits }
+        $lastColdTax   = $coldBaseRate * $lastColdUnits
+        # Only surface the per-hit segment when it carries a real figure. A real cold leg always wastes
+        # something, so a sub-cent result means "unknown" (a pre-upgrade multi-leg rollup) — drop the
+        # segment rather than print a false "$0.00 just paid".
+        if ($lastColdTax -ge 0.005) {
+            $recencyTag = if ($legsAgo -le 0) { 'just paid' } elseif ($legsAgo -eq 1) { '1 leg ago' } else { "$legsAgo legs ago" }
+            $coldParts += "${ESC}[38;5;33m`$$('{0:N2}' -f $lastColdTax) $recencyTag${ESC}[0m"
+        }
     }
+    # Segment 3 — cold-leg count (always, dim).
     $legPct  = if ($nL -gt 0) { [int][Math]::Round(100.0 * $nCold / $nL) } else { 0 }
     $coldParts += (Dim "legs $nCold/$nL ($legPct%)")
 }
@@ -1166,12 +1222,16 @@ function QuotaLine($label, $rl, $winSec) {
     $col = switch ($rung) { 0 { '38;5;40' } 1 { '38;5;220' } 2 { '38;5;208' } default { '1;31' } }
 
     # Verdict follows the FINAL rung (so a bumped line gets the louder words); detail spells the stakes.
-    # used_percentage can exceed 100 (API reports overage as >100 → pay-per-use usage credits), hence the
-    # exhausted override and the "+N%" that reconciles with the displayed NN% (e.g. 112% → +12%).
+    # At/over 100% the stdin gives us NO way to tell "blocked" from "on usage credits": rate_limits carries
+    # only used_percentage (+resets_at) — no overage/credit field — and current Claude Code pins the value at
+    # ~100 rather than reporting the old >100 overage that once made credits inferable. CC knows internally
+    # (it prints "Now using usage credits") but doesn't pass it through. So we DON'T guess: state the certain
+    # fact (cap reached) and name both outcomes, in orange (a limit/real-money warning, not the blackout-red
+    # the projection rungs wear) — never the false "dark until reset" that alarms a still-working session.
     if ($exhausted) {
-        $over    = [int][Math]::Round($consumed - 100)
-        $verdict = if ($over -ge 1) { "quota exhausted - on usage +$over%" } else { 'quota exhausted' }
-        $detail  = 'dark until reset'
+        $col     = '38;5;208'
+        $verdict = "$label cap reached"
+        $detail  = 'on credits, or blocked til reset'
     } else {
         $verdict = switch ($rung) { 0 { 'you can keep this pace' } 1 { 'slow down just a bit' } 2 { 'slow down' } default { 'slow down hard' } }
         if ($rung -eq 0 -and $null -ne $t -and $t -gt 0) {
@@ -1348,6 +1408,8 @@ try {
         nLegs        = $(if ($rollup) { [int]$rollup.nLegs } else { $null })
         nColdLegs        = $(if ($rollup) { [int]$rollup.nColdLegs } else { $null })
         coldWastedUsd    = $(if ($rollup -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0) { [Math]::Round(([double]$sessionCost / $totalUnits) * [double]$rollup.coldWastedUnits, 2) } else { $null })
+        lastColdTaxUsd   = $(if ($rollup -and [double]$rollup.sumUnits -gt 0 -and $sessionCost -gt 0 -and $rollup.PSObject.Properties.Match('lastColdWastedUnits').Count -gt 0) { [Math]::Round(([double]$sessionCost / $totalUnits) * [double]$rollup.lastColdWastedUnits, 2) } else { $null })   # the MOST RECENT cold leg's own $ tax (per-hit, not cumulative)
+        lastColdLegsAgo  = $(if ($rollup -and $rollup.PSObject.Properties.Match('lastColdLegIdx').Count -gt 0 -and [int]$rollup.lastColdLegIdx -gt 0) { [int]$rollup.nLegs - [int]$rollup.lastColdLegIdx } else { $null })   # legs since the most recent cold leg; null if none recorded
         coldStakeUsd      = $coldStakeUsd
         coldState         = $coldState
         coldBand          = $coldBand   # resolved by the chip ramp (none|calm|heads-up|act-soon|urgent|expired); the explainer reads this instead of re-deriving a band from coldCoolRemainSec
