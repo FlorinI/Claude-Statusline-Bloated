@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.1.7.1'
+$SlVersion = '4.1.8.0'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -1222,16 +1222,24 @@ function QuotaLine($label, $rl, $winSec) {
     $col = switch ($rung) { 0 { '38;5;40' } 1 { '38;5;220' } 2 { '38;5;208' } default { '1;31' } }
 
     # Verdict follows the FINAL rung (so a bumped line gets the louder words); detail spells the stakes.
-    # At/over 100% the stdin gives us NO way to tell "blocked" from "on usage credits": rate_limits carries
-    # only used_percentage (+resets_at) — no overage/credit field — and current Claude Code pins the value at
-    # ~100 rather than reporting the old >100 overage that once made credits inferable. CC knows internally
-    # (it prints "Now using usage credits") but doesn't pass it through. So we DON'T guess: state the certain
-    # fact (cap reached) and name both outcomes, in orange (a limit/real-money warning, not the blackout-red
-    # the projection rungs wear) — never the false "dark until reset" that alarms a still-working session.
+    # At the cap, overage reporting is back: CC again reports >100% (e.g. 104%) rather than pinning at
+    # ~100, which splits the exhausted state into two certainties off used_percentage alone —
+    #   >100%  you consumed MORE than the cap, only possible on usage credits: a hard block pins you AT
+    #          100 and can't be exceeded. So strictly-over-100 is unambiguous → "on usage credits".
+    #   =100%  still genuinely ambiguous (just hit the cap + blocked, vs. on credits reading exactly 100):
+    #          rate_limits carries only used_percentage (+resets_at), no overage/credit field, so we keep
+    #          the both-outcomes hedge rather than guess (never the false "dark til reset" that alarms a
+    #          still-working session). CC knows internally ("Now using usage credits") but doesn't pass it.
+    # Either case is orange — a real-money / limit warning, not the blackout-red the projection rungs wear.
     if ($exhausted) {
         $col     = '38;5;208'
-        $verdict = "$label cap reached"
-        $detail  = 'on credits, or blocked til reset'
+        if ($consumed -gt 100) {
+            $verdict = "$label over cap"
+            $detail  = 'on usage credits ' + ([char]0x00B7) + ' paying overage'
+        } else {
+            $verdict = "$label cap reached"
+            $detail  = 'on credits, or blocked til reset'
+        }
     } else {
         $verdict = switch ($rung) { 0 { 'you can keep this pace' } 1 { 'slow down just a bit' } 2 { 'slow down' } default { 'slow down hard' } }
         if ($rung -eq 0 -and $null -ne $t -and $t -gt 0) {
