@@ -9,10 +9,14 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.1.8.0'
+$SlVersion = '4.2.1.0'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+# Shared per-leg cost-driver labeller (single source of truth; render-spikes.ps1 sources the same
+# file). Feeds the big-leg spotlight cluster. Sourced defensively — if absent, that cluster self-skips.
+$legDriverLib = Join-Path $ClaudeHome '.claude/leg-driver.ps1'
+if (Test-Path -LiteralPath $legDriverLib) { . $legDriverLib }
 
 if ($env:CLAUDE_STATUSLINE_DEBUG -eq '1') {
     $input_json | Out-File -FilePath "$ClaudeHome/.claude/statusline-input-sample.json" -Encoding utf8
@@ -295,7 +299,9 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             coldWastedUnits  = [double]0  # avoidable cost units burned on cold re-caches (cw × (1.25-0.10))
             lastColdLegIdx   = [int]0     # nLegs index of the most recent cold leg (recency: surface a fresh tax)
             lastColdWastedUnits = [double]0  # waste units of the MOST RECENT cold leg alone — for the "$X N legs ago" per-hit read (vs the cumulative coldWastedUnits)
-            lastLegTtlSec    = [int]0     # cache TTL the most recent leg WROTE at, seconds: 3600 (1h, auto on a Claude subscription) / 300 (5m: API-key default, or a subscription pushed over-limit onto usage credits) / 0 = unknown. Sets the cold-gap threshold + idle countdown window so a 1h session isn't false-flagged cold at 5m.
+            lastLegTtlSec    = [int]0     # EFFECTIVE DURABLE cache TTL, seconds: 3600 (1h) when any of the last 8 cache-writing legs wrote 1h, else 300 (5m), 0 = unknown. NOT merely the last leg's write tier — a small 5m tail-write (sent while over-limit on usage credits) must not collapse the durable 1h prefix's clock. Sets the cold-gap threshold + idle countdown window. Derived from recentWriteTtls.
+            recentWriteTtls  = @()        # tiers (3600/300) of the last 8 cache-WRITING legs — resolves lastLegTtlSec to the effective durable TTL (1h if any recent write was 1h)
+            recentLegs       = @()        # capped token-mix records for the last ~12 legs (idx/inT/cw/cwUnits/cr/out/units/gapToPrev/coldTtl) — feeds the big-leg spotlight cluster's render-time classification + Get-Driver labelling
         }
     }
     # Migration shim (Option C schema). If ANY required field is absent — an older
@@ -344,6 +350,8 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             lastColdLegIdx   = [int]0
             lastColdWastedUnits = [double]0
             lastLegTtlSec    = [int]0
+            recentWriteTtls  = @()
+            recentLegs       = @()
         }
     }
     if ($null -eq $r.perLegUnits)    { $r.perLegUnits = @() }
@@ -363,6 +371,8 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
         $r | Add-Member -NotePropertyName lastColdWastedUnits -NotePropertyValue $seedLastCold
     }
     if ($r.PSObject.Properties.Match('lastLegTtlSec').Count -eq 0)   { $r | Add-Member -NotePropertyName lastLegTtlSec -NotePropertyValue ([int]0) }
+    if ($r.PSObject.Properties.Match('recentWriteTtls').Count -eq 0) { $r | Add-Member -NotePropertyName recentWriteTtls -NotePropertyValue @() }  # effective-durable-TTL history; back-fills empty, repopulates from the next cache-writing legs
+    if ($r.PSObject.Properties.Match('recentLegs').Count -eq 0)      { $r | Add-Member -NotePropertyName recentLegs -NotePropertyValue @() }  # big-leg spotlight; back-fills empty on existing rollups, populates from the next leg
     $skipLastLegCost = $needsReset
     $nLegsBefore = [int]$r.nLegs
 
@@ -378,6 +388,8 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             $r.sumUnits = 0; $r.sumOutputTokens = 0
             $r.lastInputBilled = 0; $r.lastOutputTokens = 0
             $r.perLegUnits = @(); $r.perLegOwnUnits = @()
+            if ($r.PSObject.Properties.Match('recentWriteTtls').Count -gt 0) { $r.recentWriteTtls = @() }
+            if ($r.PSObject.Properties.Match('recentLegs').Count -gt 0) { $r.recentLegs = @() }
         }
         if ([long]$r.lastByteOffset -lt $totalLen) {
             $fs.Seek([long]$r.lastByteOffset, 'Begin') | Out-Null
@@ -492,8 +504,34 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
 
                             }
                         }
+                        # Record this leg's token mix for the big-leg spotlight cluster (classification
+                        # happens at render, where base + the trailing median are known). gapToPrev/coldTtl
+                        # mirror the cold-gap test and MUST be read here — before the lastLegTs/lastLegTtlSec
+                        # updates just below re-stamp them to this leg. Pruned to the last 12 so the
+                        # persisted JSON stays bounded (the spotlight window is 8; 12 leaves slack).
+                        if ($r.PSObject.Properties.Match('recentLegs').Count -eq 0) { $r | Add-Member -NotePropertyName recentLegs -NotePropertyValue @() }
+                        $blGap = if ($null -ne $legTs -and $null -ne $r.lastLegTs) { [double]$legTs - [double]$r.lastLegTs } else { $null }
+                        $blTtl = if ([int]$r.lastLegTtlSec -gt 0) { [int]$r.lastLegTtlSec } else { 300 }
+                        $r.recentLegs += [pscustomobject]@{ idx = [int]$r.nLegs; inT = [double]$inTok; cw = [double]$cwTok; cwUnits = [double]$cwUnits; cr = [double]$crTok; out = [double]$outTok; units = [double]$units; gapToPrev = $blGap; coldTtl = [int]$blTtl }
+                        if (@($r.recentLegs).Count -gt 12) { $r.recentLegs = @($r.recentLegs[-12..-1]) }
                         if ($null -ne $legTs) { $r.lastLegTs = $legTs }
-                        if ($legTtlSec -gt 0) { $r.lastLegTtlSec = [int]$legTtlSec }   # remember the current cache regime for the next gap test + the prospective countdown
+                        if ($legTtlSec -gt 0) {
+                            # EFFECTIVE DURABLE TTL (not just this leg's write tier). Track the last 8
+                            # cache-writing legs' tiers and resolve lastLegTtlSec to 1h if ANY recent write
+                            # was 1h, else 5m. Why: on a subscription the bulk prefix is written at 1h and
+                            # stays warm at 1h (each read resets its timer); CC drops to a 5m WRITE only for
+                            # legs sent while OVER the plan limit on usage credits (confirmed at
+                            # code.claude.com/docs/en/prompt-caching). Those 5m writes are small trailing
+                            # tails and must NOT collapse the whole cold clock to 5m. The old "last writing
+                            # leg's tier" flip-flopped 1h<->5m as the quota state crossed mid-session, which
+                            # showed a 5m prospective countdown (and, past 5m idle, the no-timer "expired"
+                            # branch) and false-flagged cold legs after 5-60-min gaps. Only a SUSTAINED 5m
+                            # stretch — no 1h write in the last 8 cache-writing legs — now reads 5m.
+                            if ($r.PSObject.Properties.Match('recentWriteTtls').Count -eq 0) { $r | Add-Member -NotePropertyName recentWriteTtls -NotePropertyValue @() }
+                            $r.recentWriteTtls += [int]$legTtlSec
+                            if (@($r.recentWriteTtls).Count -gt 8) { $r.recentWriteTtls = @($r.recentWriteTtls[-8..-1]) }
+                            $r.lastLegTtlSec = if (@($r.recentWriteTtls) -contains 3600) { 3600 } else { 300 }
+                        }
                     } catch {}
                 }
                 $r.lastByteOffset = [long]$r.lastByteOffset + $consumedBytes
@@ -1272,6 +1310,47 @@ $q7 = QuotaLine '7d' $d.rate_limits.seven_day 604800
 if ($q5) { $qLines += $q5 }
 if ($q7) { $qLines += $q7 }
 
+# === Cluster 4b: big-leg spotlight (per-leg cost-spike call-out) ===
+# A leg earns its own line when it costs ≥ $BIG_LEG_FLOOR_USD (absolute spike), OR ≥ BIG_LEG_MULT× the
+# trailing-median leg AND ≥ $BIG_LEG_MIN_USD (relative spike, floored so the multiple can't fire on
+# trivial legs). The line is a live, single-row echo of the /handover-check spike panel — same Get-Driver
+# label (sourced from leg-driver.ps1) so the two never disagree — plus ×median scale and recency. It
+# stays up for BIG_LEG_WINDOW legs (its own render + 7 after); several big legs in the window each get
+# a line, newest first. Cold re-caches wear ❆ (the cold cluster owns the "why"); everything else ◆.
+$BIG_LEG_FLOOR_USD = 3.00   # absolute: any leg at/above this is big regardless of session scale
+$BIG_LEG_MULT      = 3.0    # relative: ≥ this × the trailing-median leg is big …
+$BIG_LEG_MIN_USD   = 0.50   # … but only above this floor (keeps the multiple from firing on sub-50¢ legs)
+$BIG_LEG_WINDOW    = 8      # show each big leg for this many legs total (its own render + 7 after)
+$bigLegLines = @()
+if ((Get-Command Get-Driver -ErrorAction SilentlyContinue) -and $rollup `
+        -and $rollup.PSObject.Properties.Match('recentLegs').Count -gt 0 `
+        -and $null -ne $baseTrue -and $baseTrue -gt 0 `
+        -and $null -ne $rollup.perLegUnits -and @($rollup.perLegUnits).Count -ge 1) {
+    $allUnits = @($rollup.perLegUnits | ForEach-Object { [double]$_ })
+    # Trailing-median leg in $ over the last ≤20 legs (full units), so "typical" tracks the current
+    # regime, not a cheap opening. base is flat → units-median × base = the $-median leg.
+    $medTail = if ($allUnits.Count -gt 20) { @($allUnits[($allUnits.Count - 20)..($allUnits.Count - 1)]) } else { $allUnits }
+    $medUsd  = [double]$baseTrue * (Median $medTail)
+    $nL = [int]$rollup.nLegs
+    $blRows = @()
+    foreach ($rec in @($rollup.recentLegs)) {
+        $legsAgo = $nL - [int]$rec.idx
+        if ($legsAgo -lt 0 -or $legsAgo -ge $BIG_LEG_WINDOW) { continue }   # outside the spotlight window
+        $usd   = [double]$baseTrue * [double]$rec.units
+        $isBig = ($usd -ge $BIG_LEG_FLOOR_USD) -or ($medUsd -gt 0 -and $usd -ge ($BIG_LEG_MULT * $medUsd) -and $usd -ge $BIG_LEG_MIN_USD)
+        if (-not $isBig) { continue }
+        $drv    = Get-Driver $rec
+        $isCold = ([double]$rec.cw -ge 50000 -and [double]$rec.cr -lt ([double]$rec.cw * 0.5) -and $null -ne $rec.gapToPrev -and [double]$rec.gapToPrev -gt [double]$rec.coldTtl)
+        $mk     = if ($isCold) { (ColdBlue ([char]0x2746)) } else { "${ESC}[38;5;179m$([char]0x25C6)${ESC}[0m" }
+        $scale  = if ($medUsd -gt 0) { (' ' + ('{0:N1}' -f ($usd / $medUsd)) + 'x med') } else { '' }
+        $ago    = if ($legsAgo -le 0) { 'this leg' } elseif ($legsAgo -eq 1) { '1 leg ago' } else { "$legsAgo legs ago" }
+        $dot    = [char]0x00B7
+        $line   = $mk + ' ' + (Dim "Leg $([int]$rec.idx)") + (Dim " $dot ") + (ColorLegCell $usd ('$' + ('{0:N2}' -f $usd))) + (Dim " $dot ") + "${ESC}[38;5;180m$drv${ESC}[0m" + (Dim "$scale $dot $ago")
+        $blRows += [pscustomobject]@{ legsAgo = $legsAgo; line = $line }
+    }
+    $bigLegLines = @($blRows | Sort-Object legsAgo | ForEach-Object { $_.line })   # newest (smallest legsAgo) first
+}
+
 # === Cluster 5: session ===
 # Absolute spend ($X.XX) lives in cluster 3 alongside the cost-density metrics;
 # this cluster is purely session activity (time alive vs api, lines, turn TPS).
@@ -1462,6 +1541,7 @@ if ($line2)    { $out += $line2 }
 foreach ($q in $qLines) { if ($q) { $out += $q } }   # quota: 0–2 per-window pace-gauge lines
 if ($line3)    { $out += $line3 }
 if ($coldLine) { $out += $coldLine }                 # cold-cache stats line, directly under cost
+foreach ($bl in $bigLegLines) { if ($bl) { $out += $bl } }   # big-leg spotlight: 0–N per-spike call-outs, newest first
 if ($legsLine) { $out += $legsLine }
 if ($agentsLine) { $out += $agentsLine }             # sub-agent fleet (event-gated, only when agents exist)
 if ($line5 -and $ShowSessionLine) { $out += $line5 }
