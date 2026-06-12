@@ -54,16 +54,18 @@ If `pwsh` is not found:
 
 After install, re-run `pwsh --version` to confirm.
 
-### Step 2 — download the script
+### Step 2 — download the script (two files)
 
-Fetch the raw file and save it to the user's Claude Code config directory.
+Fetch both raw files and save them to the user's Claude Code config directory. `statusline-bloated.ps1` is the status line itself; `leg-driver.ps1` is a small companion it auto-loads at runtime (it labels cost spikes for the big-leg call-out). The status line runs fine without the companion — it silently skips that one cluster — but fetch both for the full feature set.
 
-- **Source URL**: `https://raw.githubusercontent.com/FlorinI/Claude-Statusline-Bloated/main/statusline-bloated.ps1`
-- **Destination**: `~/.claude/statusline-bloated.ps1` (resolve `~` to the user's actual home directory: `$HOME` on macOS/Linux, `%USERPROFILE%` on Windows).
+- **Status line** — Source URL: `https://raw.githubusercontent.com/FlorinI/Claude-Statusline-Bloated/main/statusline-bloated.ps1` → Destination: `~/.claude/statusline-bloated.ps1`
+- **Companion** — Source URL: `https://raw.githubusercontent.com/FlorinI/Claude-Statusline-Bloated/main/leg-driver.ps1` → Destination: `~/.claude/leg-driver.ps1`
 
-Use the WebFetch tool to retrieve it, then the Write tool to save it. Preserve byte-for-byte content; this script is whitespace-sensitive in places (the ANSI escape sequences use literal ESC characters).
+Resolve `~` to the user's actual home directory: `$HOME` on macOS/Linux, `%USERPROFILE%` on Windows. Both files go in the **same** `~/.claude/` directory — the status line locates the companion relative to its own home dir.
 
-Verify the file landed: it should start with `$ErrorActionPreference = 'SilentlyContinue'`.
+Use the WebFetch tool to retrieve each, then the Write tool to save them. Preserve byte-for-byte content; the status line is whitespace-sensitive in places (the ANSI escape sequences use literal ESC characters).
+
+Verify they landed: `statusline-bloated.ps1` should start with `$ErrorActionPreference = 'SilentlyContinue'`, and `leg-driver.ps1` should contain `function Get-Driver`.
 
 ### Step 3 — wire it into `~/.claude/settings.json`
 
@@ -114,7 +116,11 @@ Report back with: which OS you detected, where you wrote the .ps1, and the final
 If you're doing this by hand:
 
 1. `pwsh --version` — install PowerShell 7 from https://github.com/PowerShell/PowerShell if missing.
-2. `curl -fsSL https://raw.githubusercontent.com/FlorinI/Claude-Statusline-Bloated/main/statusline-bloated.ps1 -o ~/.claude/statusline-bloated.ps1` (or download via browser).
+2. Download both files into `~/.claude/`:
+   - `curl -fsSL https://raw.githubusercontent.com/FlorinI/Claude-Statusline-Bloated/main/statusline-bloated.ps1 -o ~/.claude/statusline-bloated.ps1`
+   - `curl -fsSL https://raw.githubusercontent.com/FlorinI/Claude-Statusline-Bloated/main/leg-driver.ps1 -o ~/.claude/leg-driver.ps1`
+
+   The second is a small companion the status line auto-loads; skip it and everything works except the big-leg cost-spike call-out.
 3. Edit `~/.claude/settings.json` and add the `statusLine` block from Step 3 above, using your actual home directory in the path.
 4. Restart Claude Code.
 
