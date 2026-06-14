@@ -9,7 +9,7 @@ $d = $input_json | ConvertFrom-Json
 # so every reading is anchored to the threshold regime that produced it. Bump on
 # any change that shifts what the numbers mean (froz5 anchors, quality bands, cost
 # math, cold-cache logic). See docs/froz5-calibration-samples.md.
-$SlVersion = '4.2.4.0'
+$SlVersion = '4.2.5.0'
 
 # Cross-platform home dir: $env:USERPROFILE on Windows, $HOME on macOS/Linux.
 $ClaudeHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
@@ -295,13 +295,14 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             perLegOwnUnits   = @()
             costBaseline     = $null   # genuinely-new session: captured on first leg (see ~line 371)
             lastLegTs        = $null   # epoch sec of the most recent leg (cold-cache gap detector + idle countdown anchor)
+            lastWarm         = [double]0  # prior leg's (cache_read + cache_creation) = tokens warm one leg ago; cold-recache test reads this to detect a collapsed cache_read (re-cache, not new content)
             nColdLegs        = [int]0     # legs that hit a cold cache re-create after an idle gap
             coldWastedUnits  = [double]0  # avoidable cost units burned on cold re-caches (cw × (1.25-0.10))
             lastColdLegIdx   = [int]0     # nLegs index of the most recent cold leg (recency: surface a fresh tax)
             lastColdWastedUnits = [double]0  # waste units of the MOST RECENT cold leg alone — for the "$X N legs ago" per-hit read (vs the cumulative coldWastedUnits)
             lastLegTtlSec    = [int]0     # EFFECTIVE DURABLE cache TTL, seconds: 3600 (1h) when any of the last 8 cache-writing legs wrote 1h, else 300 (5m), 0 = unknown. NOT merely the last leg's write tier — a small 5m tail-write (sent while over-limit on usage credits) must not collapse the durable 1h prefix's clock. Sets the cold-gap threshold + idle countdown window. Derived from recentWriteTtls.
             recentWriteTtls  = @()        # tiers (3600/300) of the last 8 cache-WRITING legs — resolves lastLegTtlSec to the effective durable TTL (1h if any recent write was 1h)
-            recentLegs       = @()        # capped token-mix records for the last ~12 legs (idx/inT/cw/cwUnits/cr/out/units/gapToPrev/coldTtl) — feeds the big-leg spotlight cluster's render-time classification + Get-Driver labelling
+            recentLegs       = @()        # capped token-mix records for the last ~12 legs (idx/inT/cw/cwUnits/cr/out/units/gapToPrev/coldTtl/prevWarm) — feeds the big-leg spotlight cluster's render-time classification + Get-Driver labelling
         }
     }
     # Migration shim (Option C schema). If ANY required field is absent — an older
@@ -345,6 +346,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             perLegOwnUnits   = @()
             costBaseline     = $(if ($null -ne $priorBaseline) { $priorBaseline } else { 0 })  # preserve carryover-exclusion across reset; 0 only if the old schema never captured one
             lastLegTs        = $null
+            lastWarm         = [double]0
             nColdLegs        = [int]0
             coldWastedUnits  = [double]0
             lastColdLegIdx   = [int]0
@@ -359,6 +361,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
     # Patch in additive cold-cache fields if an existing (non-reset) rollup predates them — no reset,
     # so costBaseline and all history are preserved.
     if ($r.PSObject.Properties.Match('lastLegTs').Count -eq 0)       { $r | Add-Member -NotePropertyName lastLegTs -NotePropertyValue $null }
+    if ($r.PSObject.Properties.Match('lastWarm').Count -eq 0)        { $r | Add-Member -NotePropertyName lastWarm -NotePropertyValue ([double]0) }  # additive; back-fills 0 → first post-deploy leg has no prevWarm (collapse test no-ops, old behaviour), self-heals next leg
     if ($r.PSObject.Properties.Match('nColdLegs').Count -eq 0)       { $r | Add-Member -NotePropertyName nColdLegs -NotePropertyValue ([int]0) }
     if ($r.PSObject.Properties.Match('coldWastedUnits').Count -eq 0) { $r | Add-Member -NotePropertyName coldWastedUnits -NotePropertyValue ([double]0) }
     if ($r.PSObject.Properties.Match('lastColdLegIdx').Count -eq 0)  { $r | Add-Member -NotePropertyName lastColdLegIdx -NotePropertyValue ([int]0) }
@@ -390,6 +393,7 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
             $r.perLegUnits = @(); $r.perLegOwnUnits = @()
             if ($r.PSObject.Properties.Match('recentWriteTtls').Count -gt 0) { $r.recentWriteTtls = @() }
             if ($r.PSObject.Properties.Match('recentLegs').Count -gt 0) { $r.recentLegs = @() }
+            if ($r.PSObject.Properties.Match('lastWarm').Count -gt 0) { $r.lastWarm = [double]0 }
         }
         if ([long]$r.lastByteOffset -lt $totalLen) {
             $fs.Seek([long]$r.lastByteOffset, 'Begin') | Out-Null
@@ -487,12 +491,24 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                                 }
                             } catch {}
                         }
+                        $prevWarm = [double]$r.lastWarm   # tokens warm one leg ago (prior leg's cr+cw); 0 on the first post-deploy leg
                         if ($null -ne $legTs -and $null -ne $r.lastLegTs) {
                             $gap = [double]$legTs - [double]$r.lastLegTs
                             # TTL that governed whether the PRIOR cache survived this gap = the prior leg's
                             # write tier. Fall back to 300 only before any tier has been observed.
                             $prevTtl = if ([int]$r.lastLegTtlSec -gt 0) { [int]$r.lastLegTtlSec } else { 300 }
-                            if ($gap -gt $prevTtl -and $cwTok -ge 50000 -and $crTok -lt (0.5 * $cwTok)) {
+                            # Cold iff the cache genuinely expired (gap > prior TTL) AND a non-trivial write
+                            # re-created an EXPIRED prefix rather than adding NEW content. Two signatures, unioned:
+                            #   bigRewrite — the legacy full-prefix tell (cw≥50k, almost no read-back); catches
+                            #     large sessions where a cold re-cache rewrites the whole 200k+ context.
+                            #   collapsed  — cache_read fell well below what was warm a leg ago (cr < prevWarm·0.7);
+                            #     catches SMALL/young sessions whose full cold rewrite is only ~20-50k (under the 50k
+                            #     floor) yet still re-caches an expired prefix. Without it those legs mislabelled as
+                            #     "loaded ~Nk new context" and escaped the cold tax. The gap gate keeps a warm big
+                            #     paste (cr stays high → not collapsed, gap small) out of both branches.
+                            $blBigRewrite = ($cwTok -ge 50000 -and $crTok -lt (0.5 * $cwTok))
+                            $blCollapsed  = ($prevWarm -gt 0 -and $crTok -lt ($prevWarm * 0.7))
+                            if ($gap -gt $prevTtl -and $cwTok -ge 8000 -and ($blBigRewrite -or $blCollapsed)) {
                                 # Waste = what this cold write actually cost (per-tier units) minus what the
                                 # same tokens would have cost had the cache stayed warm (a read). Using $cwUnits
                                 # keeps it exact even on a mixed-tier leg, and tracks the real 2×/1.25× write tier.
@@ -512,9 +528,10 @@ function UpdateSessionRollups($sessionId, $tpath, $currentCost, $projRoot) {
                         if ($r.PSObject.Properties.Match('recentLegs').Count -eq 0) { $r | Add-Member -NotePropertyName recentLegs -NotePropertyValue @() }
                         $blGap = if ($null -ne $legTs -and $null -ne $r.lastLegTs) { [double]$legTs - [double]$r.lastLegTs } else { $null }
                         $blTtl = if ([int]$r.lastLegTtlSec -gt 0) { [int]$r.lastLegTtlSec } else { 300 }
-                        $r.recentLegs += [pscustomobject]@{ idx = [int]$r.nLegs; inT = [double]$inTok; cw = [double]$cwTok; cwUnits = [double]$cwUnits; cr = [double]$crTok; out = [double]$outTok; units = [double]$units; gapToPrev = $blGap; coldTtl = [int]$blTtl }
+                        $r.recentLegs += [pscustomobject]@{ idx = [int]$r.nLegs; inT = [double]$inTok; cw = [double]$cwTok; cwUnits = [double]$cwUnits; cr = [double]$crTok; out = [double]$outTok; units = [double]$units; gapToPrev = $blGap; coldTtl = [int]$blTtl; prevWarm = [double]$prevWarm }
                         if (@($r.recentLegs).Count -gt 12) { $r.recentLegs = @($r.recentLegs[-12..-1]) }
                         if ($null -ne $legTs) { $r.lastLegTs = $legTs }
+                        $r.lastWarm = [double]$crTok + [double]$cwTok   # stamp for the NEXT leg's collapse test; after the cold test above has consumed the prior value
                         if ($legTtlSec -gt 0) {
                             # EFFECTIVE DURABLE TTL (not just this leg's write tier). Track the last 8
                             # cache-writing legs' tiers and resolve lastLegTtlSec to 1h if ANY recent write
@@ -1340,7 +1357,9 @@ if ((Get-Command Get-Driver -ErrorAction SilentlyContinue) -and $rollup `
         $isBig = ($usd -ge $BIG_LEG_FLOOR_USD) -or ($medUsd -gt 0 -and $usd -ge ($BIG_LEG_MULT * $medUsd) -and $usd -ge $BIG_LEG_MIN_USD)
         if (-not $isBig) { continue }
         $drv    = Get-Driver $rec
-        $isCold = ([double]$rec.cw -ge 50000 -and [double]$rec.cr -lt ([double]$rec.cw * 0.5) -and $null -ne $rec.gapToPrev -and [double]$rec.gapToPrev -gt [double]$rec.coldTtl)
+        # Shared predicate (leg-driver.ps1) so the ❆ marker can never disagree with Get-Driver's "(cold …)"
+        # label or the cold-tax count. Reads $rec.prevWarm; stale pre-deploy records lack it → no-op (old behaviour).
+        $isCold = Test-ColdLeg $rec
         $mk     = if ($isCold) { (ColdBlue ([char]0x2746)) } else { "${ESC}[38;5;179m$([char]0x25C6)${ESC}[0m" }
         $scale  = if ($medUsd -gt 0) { (' ' + ('{0:N1}' -f ($usd / $medUsd)) + 'x med') } else { '' }
         $ago    = if ($legsAgo -le 0) { 'this leg' } elseif ($legsAgo -eq 1) { '1 leg ago' } else { "$legsAgo legs ago" }

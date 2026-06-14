@@ -15,21 +15,20 @@ function Get-Driver($l) {
     $winner = ($terms.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
     switch ($winner) {
         'cw'  {
-            # cw dominant has THREE causes that look identical in the weighted cost. The
-            # "full-cache rewrite" signature — cw≥50k ∧ cr<0.5·cw — covers two of them: Claude
-            # Code periodically re-writes the whole prefix at 1.25× with little read-back. Whether
-            # that rewrite is a COLD re-cache (idle past the cache TTL expired the whole cache) or a
-            # WARM rewrite (the prefix re-issued seconds later — NOT new content) is decided by whether
-            # the idle gap exceeded the PRIOR cache's TTL ($l.coldTtl: 3600 on a subscription's 1h cache,
-            # 300 on 5m), mirroring UpdateSessionRollups' tier-aware gap test. Only when
-            # read-back is large relative to the write (cr ≳ cw — signature ABSENT) was context
-            # genuinely added: the prior context stayed warm and was read back beside the new write.
-            # The old two-way split mislabeled warm rewrites as "new context", and their numbers
-            # summed past the context-window size (the tell).
-            $isRewrite = ($l.cw -ge 50000 -and $l.cr -lt ($l.cw * 0.5))
-            if ($isRewrite -and $null -ne $l.gapToPrev -and $l.gapToPrev -gt $l.coldTtl) {
+            # cw dominant has THREE causes that look identical in the weighted cost: a COLD re-cache
+            # (idle past the cache TTL expired the prefix → re-write), a WARM rewrite (the prefix
+            # re-issued seconds later — NOT new content), or genuinely-added new context.
+            #   COLD = the shared Test-ColdLeg predicate (gap > prior TTL, and an expired prefix re-created
+            #     — by the legacy full-rewrite signature OR by cache_read collapsing below what was warm a
+            #     leg ago). The collapse arm catches small/young sessions whose cold rewrite is under the 50k
+            #     floor; they used to mislabel as "loaded ~Nk new context".
+            #   WARM rewrite = the legacy full-rewrite signature WITHOUT the cold gap (prefix re-issued within
+            #     the TTL); kept as before. Its numbers sum past the context-window size (the tell).
+            #   else = context genuinely added (large read-back beside the new write).
+            $bigRewrite = ($l.cw -ge 50000 -and $l.cr -lt ($l.cw * 0.5))
+            if (Test-ColdLeg $l) {
                 're-cached ~{0}k (cold — cache expired after idle)' -f [int][Math]::Round($l.cw / 1000)
-            } elseif ($isRewrite) {
+            } elseif ($bigRewrite) {
                 're-cached ~{0}k (warm rewrite, not new content)' -f [int][Math]::Round($l.cw / 1000)
             } else {
                 'loaded ~{0}k new context' -f [int][Math]::Round($l.cw / 1000)
@@ -46,13 +45,25 @@ function Get-Driver($l) {
 # statusline-bloated.ps1's CacheWriteUnits.
 $M_INPUT = 1.0; $M_CACHE_WRITE_5M = 1.25; $M_CACHE_WRITE_1H = 2.0; $M_CACHE_READ = 0.10; $M_OUTPUT = 5.0
 
-# Test-ColdLeg — the ONE cold-tax predicate, shared by render-spikes (panel ❆ marks) and handover-facts
-# (fact-sheet count) so the explainer's prose and its spike panel can NEVER disagree (the within-report
-# "1 leg in prose / 2 in panel" contradiction). A leg is cold iff a full-prefix re-write (cw≥50k ∧
-# cr<0.5·cw) was preceded by an idle gap longer than the prior cache's effective-durable TTL ($l.coldTtl).
+# Test-ColdLeg — the ONE cold-tax predicate, shared by render-spikes (panel ❆ marks), handover-facts
+# (fact-sheet count), Get-Driver (the "(cold …)" label) and the live status line, so the explainer's prose,
+# its spike panel, the live ❆ marker and the tax $ can NEVER disagree. A leg is cold iff the cache genuinely
+# expired (idle gap > the prior cache's effective-durable TTL $l.coldTtl) AND a non-trivial write (cw≥8k)
+# re-created an EXPIRED prefix rather than adding NEW content — proven by EITHER signature:
+#   bigRewrite — the legacy full-prefix tell (cw≥50k ∧ cr<0.5·cw); catches large sessions re-caching a 200k+
+#     context in one go.
+#   collapsed  — cache_read fell well below what was warm one leg ago ($l.prevWarm = the prior leg's cr+cw;
+#     cr < prevWarm·0.7); catches small/young sessions whose full cold rewrite is only ~20-50k (under the 50k
+#     floor) yet is still a cold call-up. Without it those legs mislabelled as "loaded ~Nk new context" and
+#     silently escaped the cold tax. prevWarm=0 (first post-deploy leg / pre-prevWarm record) → arm no-ops.
+# The union is purely ADDITIVE over the old floor-only rule: every leg the old rule flagged still flags
+# (bigRewrite arm), plus the sub-floor collapse cases. The gap gate keeps a warm big paste (cr stays high,
+# small gap) out of both arms.
 function Test-ColdLeg($l) {
-    [double]$l.cw -ge 50000 -and [double]$l.cr -lt ([double]$l.cw * 0.5) `
-        -and $null -ne $l.gapToPrev -and [double]$l.gapToPrev -gt [double]$l.coldTtl
+    $bigRewrite = ([double]$l.cw -ge 50000 -and [double]$l.cr -lt ([double]$l.cw * 0.5))
+    $collapsed  = ([double]$l.prevWarm -gt 0 -and [double]$l.cr -lt ([double]$l.prevWarm * 0.7))
+    $null -ne $l.gapToPrev -and [double]$l.gapToPrev -gt [double]$l.coldTtl `
+        -and [double]$l.cw -ge 8000 -and ($bigRewrite -or $collapsed)
 }
 
 # Get-ScannedLegs — the ONE authoritative transcript scan for the /handover-check renderers. Per-leg
@@ -64,7 +75,7 @@ function Test-ColdLeg($l) {
 # Test-ColdLeg. Off the hot path (only /handover-check). Returns @() on a missing/unreadable transcript.
 function Get-ScannedLegs([string]$transcriptPath) {
     if (-not $transcriptPath -or -not (Test-Path $transcriptPath)) { return ,@() }
-    $seen = @{}; $legs = @(); $idx = 0; $prevTs = $null; $recentTtls = @()
+    $seen = @{}; $legs = @(); $idx = 0; $prevTs = $null; $recentTtls = @(); $prevWarm = [double]0
     foreach ($line in [System.IO.File]::ReadAllLines($transcriptPath)) {
         if ($line -notmatch '"type"\s*:\s*"assistant"') { continue }
         $p = $null; try { $p = $line | ConvertFrom-Json } catch { continue }
@@ -91,7 +102,8 @@ function Get-ScannedLegs([string]$transcriptPath) {
         $gapToPrev = if ($null -ne $legTs -and $null -ne $prevTs) { [double]$legTs - [double]$prevTs } else { $null }
         if ($null -ne $legTs) { $prevTs = $legTs }
         $durablePrevTtl = if ($recentTtls -contains 3600) { 3600 } else { 300 }
-        $legs += [pscustomobject]@{ idx = $idx; inT = $inT; cw = $cw; cwUnits = $cwUnits; cr = $cr; out = $out; units = $units; gapToPrev = $gapToPrev; coldTtl = $durablePrevTtl }
+        $legs += [pscustomobject]@{ idx = $idx; inT = $inT; cw = $cw; cwUnits = $cwUnits; cr = $cr; out = $out; units = $units; gapToPrev = $gapToPrev; coldTtl = $durablePrevTtl; prevWarm = $prevWarm }
+        $prevWarm = $cr + $cw   # warm tokens for the NEXT leg's collapse test; stamped AFTER this leg's record consumes the prior value
         if ($legTtl -gt 0) { $recentTtls += $legTtl; if (@($recentTtls).Count -gt 8) { $recentTtls = @($recentTtls[-8..-1]) } }
     }
     ,$legs
