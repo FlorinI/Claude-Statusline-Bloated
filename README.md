@@ -1,3 +1,16 @@
+> # ⚠️ Superseded — this repository is archived
+>
+> This PowerShell status line has been **replaced by a pure-Node, zero-dependency, cross-platform
+> rewrite** — no PowerShell required — that ships with a conflict-safe, *mergeful* installer and a few
+> workflow guardrail commands (`/handover`, `/handover-check`, `/grill-me`, dialogue, an RCA skill).
+>
+> ### 👉 Use [**Florian's Claude Code Kit**](https://github.com/FlorinI/Florians-Claude-Code-Kit) instead
+>
+> This repo is **archived and no longer maintained** — kept read-only for historical reference. All
+> installs, fixes, and new work happen in the kit above.
+
+---
+
 # Claude-Statusline-Bloated
 
 A dense, multi-line status line for [Claude Code](https://claude.com/claude-code). Surfaces every dial that affects the model's intelligence, latency, and cost: model + flags, context window (with a two-axis quality read), a per-leg cost-escalation cluster + sparkline, rate-limit quotas, session duration + turn TPS, and git state — all color-coded by health.
